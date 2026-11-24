@@ -5,7 +5,9 @@ use anyhow::{anyhow, ensure};
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 
+use crate::outbox::{Outbox, sender};
 use crate::sys::*;
+use crate::video::PixelBuffer;
 
 /// 8-bit 4:2:0, Y in its own plane, video range (`420v`).
 const PIXEL_FORMAT_420V: u32 = 0x3432_3076;
@@ -19,58 +21,51 @@ pub struct Picture {
     pub luma: Vec<u8>,
 }
 
-/// Where VideoToolbox's callback leaves its pictures (it runs during `decode`, on the decoding thread).
-struct Sink {
-    width: usize,
-    height: usize,
-    /// Which pictures to keep (by presentation time, in the track's timescale), decided by the caller.
-    want: Box<dyn FnMut(i64) -> bool + Send>,
-    out: Vec<Picture>,
-    error: Option<OSStatus>,
-}
+/// What the decoder's callback sends: a decoded picture with its presentation time, or why one failed.
+type PictureMsg = Result<(i64, PixelBuffer), OSStatus>;
 
 /// An HEVC decoder (hardware where the Mac has one) that hands back pictures shrunk to the scan's size.
 pub struct HevcDecoder {
     session: VTDecompressionSessionRef,
     format: CMFormatDescriptionRef,
-    sink: Box<std::sync::Mutex<Sink>>,
+    outbox: Outbox<PictureMsg>,
     timescale: u32,
+    width: usize,
+    height: usize,
+    /// Which pictures to keep (by presentation time, in the track's timescale), decided by the caller.
+    want: Box<dyn FnMut(i64) -> bool + Send>,
 }
 
 // The session is used from one thread at a time (the scan's task); VideoToolbox sessions may move between threads.
 unsafe impl Send for HevcDecoder {}
 
 extern "C" fn on_picture(refcon: *mut c_void, _frame: *mut c_void, status: OSStatus, _flags: u32, image: CVImageBufferRef, pts: CMTime, _dur: CMTime) {
-    // SAFETY: refcon is the decoder's boxed, locked Sink, alive for the session's life. VideoToolbox usually calls
-    // this while `decode` runs, but may call it on its own thread, so the sink is locked by both sides.
-    let mut sink = crate::video::lock(unsafe { &*(refcon as *const std::sync::Mutex<Sink>) });
-    if status != 0 || image.is_null() {
-        if status != 0 {
-            sink.error = Some(status);
-        }
-        return;
-    }
-    if !(sink.want)(pts.value) {
-        return;
-    }
-    // SAFETY: image is a CVPixelBuffer valid for this call; it is locked read-only while its luma plane is read.
+    let msg = if status != 0 {
+        Err(status)
+    } else if image.is_null() {
+        return; // nothing decoded
+    } else {
+        // SAFETY: a valid pixel buffer for this call; retained to outlive it.
+        Ok((pts.value, unsafe { PixelBuffer::retain(image) }))
+    };
+    // SAFETY: refcon is the decoder's outbox context, alive for the session's life.
+    let _ = unsafe { sender::<PictureMsg>(refcon) }.send(msg);
+}
+
+/// A decoded picture's luma, shrunk to `dw`×`dh` and stretched to full range.
+fn luma(picture: &PixelBuffer, dw: usize, dh: usize) -> anyhow::Result<Vec<u8>> {
+    let image = picture.raw();
+    // SAFETY: a live pixel buffer, locked read-only while its luma plane is read, then unlocked.
     unsafe {
         let format = CVPixelBufferGetPixelFormatType(image);
-        if format != PIXEL_FORMAT_420V && format != PIXEL_FORMAT_420F {
-            sink.error = Some(-1);
-            return;
-        }
-        if CVPixelBufferLockBaseAddress(image, 1) != 0 {
-            sink.error = Some(-2);
-            return;
-        }
+        ensure!(format == PIXEL_FORMAT_420V || format == PIXEL_FORMAT_420F, "unexpected pixel format {format:#x}");
+        ensure!(CVPixelBufferLockBaseAddress(image, 1) == 0, "cannot read the picture");
         let base = CVPixelBufferGetBaseAddressOfPlane(image, 0);
         let stride = CVPixelBufferGetBytesPerRowOfPlane(image, 0);
         let (w, h) = (CVPixelBufferGetWidthOfPlane(image, 0), CVPixelBufferGetHeightOfPlane(image, 0));
-        let plane = std::slice::from_raw_parts(base, stride * h);
-        let luma = shrink(plane, w, h, stride, sink.width, sink.height, format == PIXEL_FORMAT_420V);
+        let out = (!base.is_null()).then(|| shrink(std::slice::from_raw_parts(base, stride * h), w, h, stride, dw, dh, format == PIXEL_FORMAT_420V));
         CVPixelBufferUnlockBaseAddress(image, 1);
-        sink.out.push(Picture { pts: pts.value, luma });
+        out.ok_or_else(|| anyhow!("the picture has no luma plane"))
     }
 }
 
@@ -120,8 +115,8 @@ impl HevcDecoder {
             )
         };
         ensure!(st == 0, "HEVC format description: OSStatus {st}");
-        let sink = Box::new(std::sync::Mutex::new(Sink { width, height, want, out: Vec::new(), error: None }));
-        let record = VTDecompressionOutputCallbackRecord { callback: on_picture, refcon: (&raw const *sink).cast_mut().cast() };
+        let outbox = Outbox::new();
+        let record = VTDecompressionOutputCallbackRecord { callback: on_picture, refcon: outbox.context() };
         let mut session: VTDecompressionSessionRef = null();
         // SAFETY: the attributes dictionary and number are created and released here; the callback record is
         // copied by VideoToolbox; session is an out-parameter.
@@ -148,7 +143,7 @@ impl HevcDecoder {
             unsafe { CFRelease(format) };
             return Err(anyhow!("VideoToolbox decoder: OSStatus {st}"));
         }
-        Ok(Self { session, format, sink, timescale })
+        Ok(Self { session, format, outbox, timescale, width, height, want })
     }
 
     /// Decode one coded picture (length-prefixed NAL units) with its times; returns the pictures that came out.
@@ -179,18 +174,26 @@ impl HevcDecoder {
             CFRelease(sample);
             ensure!(st == 0, "VideoToolbox decode: OSStatus {st}");
         }
-        let mut sink = crate::video::lock(&self.sink);
-        if let Some(e) = sink.error.take() {
-            return Err(anyhow!("VideoToolbox picture: OSStatus {e}"));
-        }
-        Ok(std::mem::take(&mut sink.out))
+        self.take()
     }
 
     /// Pictures still inside the decoder.
     pub fn flush(&mut self) -> Vec<Picture> {
         // SAFETY: the session is live.
         unsafe { VTDecompressionSessionWaitForAsynchronousFrames(self.session) };
-        std::mem::take(&mut crate::video::lock(&self.sink).out)
+        self.take().unwrap_or_default()
+    }
+
+    /// The pictures the callback has sent that the caller wants, shrunk; or the first error.
+    fn take(&mut self) -> anyhow::Result<Vec<Picture>> {
+        let mut out = Vec::new();
+        for msg in self.outbox.drain() {
+            let (pts, picture) = msg.map_err(|e| anyhow!("VideoToolbox picture: OSStatus {e}"))?;
+            if (self.want)(pts) {
+                out.push(Picture { pts, luma: luma(&picture, self.width, self.height)? });
+            }
+        }
+        Ok(out)
     }
 }
 

@@ -5,14 +5,8 @@ use crate::sys::*;
 use anyhow::{anyhow, ensure};
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 
-/// A callback sink's lock. VideoToolbox calls its output callbacks on its own threads (always for compression,
-/// sometimes for decompression), so the sink is shared with the caller and must be locked by both; a poisoned lock
-/// is still usable (nothing in a sink can be left half-updated).
-pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
-}
+use crate::outbox::{Outbox, sender};
 
 /// A retained CVPixelBuffer (a decoded picture), released on drop.
 pub struct PixelBuffer(CVImageBufferRef);
@@ -22,7 +16,7 @@ unsafe impl Send for PixelBuffer {}
 impl PixelBuffer {
     /// Take a +1 reference.
     /// SAFETY: `pb` must be a valid CVPixelBuffer.
-    unsafe fn retain(pb: CVImageBufferRef) -> Self {
+    pub(crate) unsafe fn retain(pb: CVImageBufferRef) -> Self {
         unsafe { CFRetain(pb) };
         Self(pb)
     }
@@ -59,27 +53,27 @@ pub struct Decoded {
     pub picture: PixelBuffer,
 }
 
-struct DecodeSink {
-    out: Vec<Decoded>,
-    error: Option<OSStatus>,
-}
+/// What the decoder's callback sends: a picture, or why one failed.
+type DecodeMsg = Result<Decoded, OSStatus>;
 
 extern "C" fn on_decoded(refcon: *mut c_void, _f: *mut c_void, status: OSStatus, _flags: u32, image: CVImageBufferRef, pts: CMTime, _d: CMTime) {
-    // SAFETY: refcon is the decoder's boxed, locked sink, alive for the session's life.
-    let mut sink = lock(unsafe { &*(refcon as *const Mutex<DecodeSink>) });
-    if status != 0 {
-        sink.error = Some(status);
-    } else if !image.is_null() {
+    let msg = if status != 0 {
+        Err(status)
+    } else if image.is_null() {
+        return; // nothing decoded (a dropped frame)
+    } else {
         // SAFETY: a valid pixel buffer for this call; retained to outlive it.
-        sink.out.push(Decoded { pts: pts.value, picture: unsafe { PixelBuffer::retain(image) } });
-    }
+        Ok(Decoded { pts: pts.value, picture: unsafe { PixelBuffer::retain(image) } })
+    };
+    // SAFETY: refcon is the decoder's outbox context, alive for the session's life.
+    let _ = unsafe { sender::<DecodeMsg>(refcon) }.send(msg);
 }
 
 /// Decodes broadcast MPEG-2 (or another codec VideoToolbox knows by its four-character code) into pixel buffers.
 pub struct Decoder {
     session: VTDecompressionSessionRef,
     format: CMFormatDescriptionRef,
-    sink: Box<Mutex<DecodeSink>>,
+    outbox: Outbox<DecodeMsg>,
     timescale: u32,
 }
 
@@ -108,8 +102,8 @@ impl Decoder {
 
     /// A decoder for a format description (taken over: released with the decoder).
     fn with_format(format: CMFormatDescriptionRef, timescale: u32) -> anyhow::Result<Self> {
-        let sink = Box::new(Mutex::new(DecodeSink { out: Vec::new(), error: None }));
-        let record = VTDecompressionOutputCallbackRecord { callback: on_decoded, refcon: (&raw const *sink).cast_mut().cast() };
+        let outbox = Outbox::new();
+        let record = VTDecompressionOutputCallbackRecord { callback: on_decoded, refcon: outbox.context() };
         let mut session: VTDecompressionSessionRef = null();
         // SAFETY: as in mac.rs: attributes created and released here, record copied, session out-parameter.
         let st = unsafe {
@@ -135,7 +129,7 @@ impl Decoder {
             unsafe { CFRelease(format) };
             return Err(anyhow!("video decoder: OSStatus {st}"));
         }
-        Ok(Self { session, format, sink, timescale })
+        Ok(Self { session, format, outbox, timescale })
     }
 
     /// Decode one coded picture; returns the pictures that came out (in decode order: sort by `pts`).
@@ -163,17 +157,20 @@ impl Decoder {
                 return Err(anyhow!("video decode: OSStatus {st}"));
             }
         }
-        let mut sink = lock(&self.sink);
-        if let Some(e) = sink.error.take() {
-            return Err(anyhow!("video decode: OSStatus {e}"));
+        let mut out = Vec::new();
+        for msg in self.outbox.drain() {
+            match msg {
+                Ok(d) => out.push(d),
+                Err(e) => return Err(anyhow!("video decode: OSStatus {e}")),
+            }
         }
-        Ok(std::mem::take(&mut sink.out))
+        Ok(out)
     }
 
     pub fn flush(&mut self) -> Vec<Decoded> {
         // SAFETY: a live session.
         unsafe { VTDecompressionSessionWaitForAsynchronousFrames(self.session) };
-        std::mem::take(&mut lock(&self.sink).out)
+        self.outbox.drain().into_iter().filter_map(Result::ok).collect()
     }
 }
 
@@ -196,31 +193,31 @@ pub struct Encoded {
     pub keyframe: bool,
 }
 
-struct EncodeSink {
-    out: Vec<Encoded>,
-    error: Option<OSStatus>,
-    /// The `hvcC` box body, from the first output's format description.
-    hvcc: Option<Vec<u8>>,
+/// What the encoder's callback sends: an encoded picture (with the `hvcC` box body on keyframes, for the
+/// owner to keep the first), or why encoding failed.
+enum EncodeMsg {
+    Frame(Encoded, Option<Vec<u8>>),
+    Error(OSStatus),
 }
 
 extern "C" fn on_encoded(refcon: *mut c_void, _f: *mut c_void, status: OSStatus, _flags: u32, sample: CMSampleBufferRef) {
-    // SAFETY: refcon is the encoder's boxed, locked sink, alive for the session's life. VideoToolbox calls this on
-    // its own thread, while the encoder's owner may be taking output: hence the lock.
-    let mut sink = lock(unsafe { &*(refcon as *const Mutex<EncodeSink>) });
+    // SAFETY: refcon is the encoder's outbox context, alive for the session's life. This runs on VideoToolbox's
+    // thread; the outbox's channel is what makes that safe.
+    let tx = unsafe { sender::<EncodeMsg>(refcon) };
     if status != 0 {
-        sink.error = Some(status);
+        let _ = tx.send(EncodeMsg::Error(status));
         return;
     }
     if sample.is_null() {
         return; // dropped frame
     }
     // SAFETY: a valid sample buffer for this call; everything read from it is copied out.
-    unsafe {
+    let msg = unsafe {
         let block = CMSampleBufferGetDataBuffer(sample);
         let len = CMBlockBufferGetDataLength(block);
         let mut data = vec![0u8; len];
         if CMBlockBufferCopyDataBytes(block, 0, len, data.as_mut_ptr().cast()) != 0 {
-            sink.error = Some(-3);
+            let _ = tx.send(EncodeMsg::Error(-3));
             return;
         }
         let pts = CMSampleBufferGetPresentationTimeStamp(sample);
@@ -231,22 +228,25 @@ extern "C" fn on_encoded(refcon: *mut c_void, _f: *mut c_void, status: OSStatus,
             let v = CFDictionaryGetValue(dict, kCMSampleAttachmentKey_NotSync);
             !v.is_null() && v == kCFBooleanTrue
         };
-        if sink.hvcc.is_none() {
+        // The codec configuration rides along with every keyframe (cheap: a keyframe every 2 s).
+        let mut hvcc = None;
+        if !not_sync {
             let format = CMSampleBufferGetFormatDescription(sample);
             let atoms = CMFormatDescriptionGetExtension(format, kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
             if !atoms.is_null() {
                 let key = CFStringCreateWithCString(null(), c"hvcC".as_ptr(), 0x0800_0100);
-                let data = CFDictionaryGetValue(atoms, key);
+                let box_ = CFDictionaryGetValue(atoms, key);
                 CFRelease(key);
-                if !data.is_null() {
-                    sink.hvcc = Some(std::slice::from_raw_parts(CFDataGetBytePtr(data), CFDataGetLength(data) as usize).to_vec());
+                if !box_.is_null() {
+                    hvcc = Some(std::slice::from_raw_parts(CFDataGetBytePtr(box_), CFDataGetLength(box_) as usize).to_vec());
                 }
             }
         }
         let pts = pts.value;
         let dts = if dts.flags & 1 != 0 { dts.value } else { pts };
-        sink.out.push(Encoded { pts, dts, data, keyframe: !not_sync });
-    }
+        EncodeMsg::Frame(Encoded { pts, dts, data, keyframe: !not_sync }, hvcc)
+    };
+    let _ = tx.send(msg);
 }
 
 /// How hard the encoder squeezes: an average bitrate, or a constant quality (0.0-1.0) that spends bits where the
@@ -261,7 +261,9 @@ pub enum Rate {
 /// every `max_key_secs`.
 pub struct Encoder {
     session: VTCompressionSessionRef,
-    sink: Box<Mutex<EncodeSink>>,
+    outbox: Outbox<EncodeMsg>,
+    /// The `hvcC` box body, from the first keyframe.
+    hvcc: Option<Vec<u8>>,
     timescale: u32,
     force_key: CFDictionaryRef,
 }
@@ -270,7 +272,7 @@ unsafe impl Send for Encoder {}
 
 impl Encoder {
     pub fn new(width: u32, height: u32, rate: Rate, fps: f64, max_key_secs: f64, realtime: bool, timescale: u32) -> anyhow::Result<Self> {
-        let sink = Box::new(Mutex::new(EncodeSink { out: Vec::new(), error: None, hvcc: None }));
+        let outbox = Outbox::new();
         let mut session: VTCompressionSessionRef = null();
         // SAFETY: the dictionaries and numbers are created, used and released here; session is an out-parameter
         // and the sink outlives it (it is dropped after the session is invalidated).
@@ -294,7 +296,7 @@ impl Encoder {
                 null(),
                 null(),
                 on_encoded,
-                (&raw const *sink).cast_mut().cast(),
+                outbox.context(),
                 &raw mut session,
             );
             CFRelease(spec);
@@ -336,7 +338,7 @@ impl Encoder {
                 &raw const kCFTypeDictionaryKeyCallBacks,
                 &raw const kCFTypeDictionaryValueCallBacks,
             );
-            Ok(Self { session, sink, timescale, force_key })
+            Ok(Self { session, outbox, hvcc: None, timescale, force_key })
         }
     }
 
@@ -356,11 +358,24 @@ impl Encoder {
             )
         };
         ensure!(st == 0, "HEVC encode: OSStatus {st}");
-        let mut sink = lock(&self.sink);
-        if let Some(e) = sink.error.take() {
-            return Err(anyhow!("HEVC encode: OSStatus {e}"));
+        self.take()
+    }
+
+    /// What the callback has sent: the encoded pictures, or the first error.
+    fn take(&mut self) -> anyhow::Result<Vec<Encoded>> {
+        let mut out = Vec::new();
+        for msg in self.outbox.drain() {
+            match msg {
+                EncodeMsg::Frame(e, hvcc) => {
+                    if self.hvcc.is_none() {
+                        self.hvcc = hvcc;
+                    }
+                    out.push(e);
+                }
+                EncodeMsg::Error(e) => return Err(anyhow!("HEVC encode: OSStatus {e}")),
+            }
         }
-        Ok(std::mem::take(&mut sink.out))
+        Ok(out)
     }
 
     /// Everything still in the encoder.
@@ -368,12 +383,12 @@ impl Encoder {
         // SAFETY: a live session; an invalid time means "all frames".
         let st = unsafe { VTCompressionSessionCompleteFrames(self.session, CMTime::INVALID) };
         ensure!(st == 0, "HEVC encode: OSStatus {st}");
-        Ok(std::mem::take(&mut lock(&self.sink).out))
+        self.take()
     }
 
     /// The `hvcC` box body, once the first picture is out.
-    pub fn hvcc(&self) -> Option<Vec<u8>> {
-        lock(&self.sink).hvcc.clone()
+    pub fn hvcc(&self) -> Option<&[u8]> {
+        self.hvcc.as_deref()
     }
 }
 
