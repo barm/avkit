@@ -96,7 +96,13 @@ struct Packet<'a> {
 
 const NO_MORE_INPUT: OSStatus = 0x6e6d_7264;
 
-extern "C" fn feed_packet(_c: AudioConverterRef, n: *mut u32, list: *mut AudioBufferList, desc: *mut *mut AudioStreamPacketDescription, user: *mut c_void) -> OSStatus {
+extern "C" fn feed_packet(
+    _c: AudioConverterRef,
+    n: *mut u32,
+    list: *mut AudioBufferList,
+    desc: *mut *mut AudioStreamPacketDescription,
+    user: *mut c_void,
+) -> OSStatus {
     // SAFETY: user is the Packet passed to FillComplexBuffer, alive for that call.
     unsafe {
         let p = &mut *(user as *mut Packet);
@@ -155,7 +161,13 @@ impl Ac3Decoder {
     }
 
     fn with_format(format: u32, channels: u32, samples: u32) -> anyhow::Result<Self> {
-        let input = AudioStreamBasicDescription { mSampleRate: f64::from(RATE), mFormatID: format, mFramesPerPacket: samples, mChannelsPerFrame: channels, ..Default::default() };
+        let input = AudioStreamBasicDescription {
+            mSampleRate: f64::from(RATE),
+            mFormatID: format,
+            mFramesPerPacket: samples,
+            mChannelsPerFrame: channels,
+            ..Default::default()
+        };
         let output = pcm(CHANNELS as u32);
         let mut converter: AudioConverterRef = null();
         // SAFETY: valid descriptions; out-parameter; the layout struct is copied by the converter.
@@ -181,7 +193,10 @@ impl Ac3Decoder {
         let mut packet = Packet { data: Some(frame), desc: AudioStreamPacketDescription::default() };
         let capacity = (self.out.len() / CHANNELS) as u32;
         let mut frames = capacity;
-        let mut list = AudioBufferList { mNumberBuffers: 1, mBuffers: [AudioBuffer { mNumberChannels: CHANNELS as u32, mDataByteSize: (self.out.len() * 4) as u32, mData: self.out.as_mut_ptr().cast() }] };
+        let mut list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [AudioBuffer { mNumberChannels: CHANNELS as u32, mDataByteSize: (self.out.len() * 4) as u32, mData: self.out.as_mut_ptr().cast() }],
+        };
         // SAFETY: the callback's data lives for the call; the output list points at our buffer of `frames` frames.
         let st = unsafe { AudioConverterFillComplexBuffer(self.converter, feed_packet, (&raw mut packet).cast(), &raw mut frames, &raw mut list, null_mut()) };
         ensure!(st == 0 || st == NO_MORE_INPUT, "AC-3 decode: OSStatus {st}");
@@ -205,7 +220,13 @@ struct Fifo {
     draining: bool,
 }
 
-extern "C" fn feed_pcm(_c: AudioConverterRef, n: *mut u32, list: *mut AudioBufferList, _desc: *mut *mut AudioStreamPacketDescription, user: *mut c_void) -> OSStatus {
+extern "C" fn feed_pcm(
+    _c: AudioConverterRef,
+    n: *mut u32,
+    list: *mut AudioBufferList,
+    _desc: *mut *mut AudioStreamPacketDescription,
+    user: *mut c_void,
+) -> OSStatus {
     // SAFETY: user is the encoder's Fifo, alive for the FillComplexBuffer call; the buffer handed out stays
     // valid until that call returns (nothing else touches the FIFO meanwhile).
     unsafe {
@@ -243,7 +264,13 @@ unsafe impl Send for AacEncoder {}
 impl AacEncoder {
     pub fn new(bitrate: u32) -> anyhow::Result<Self> {
         let input = pcm(CHANNELS as u32);
-        let output = AudioStreamBasicDescription { mSampleRate: f64::from(RATE), mFormatID: u32::from_be_bytes(*b"aac "), mFramesPerPacket: AAC_PACKET_SAMPLES as u32, mChannelsPerFrame: CHANNELS as u32, ..Default::default() };
+        let output = AudioStreamBasicDescription {
+            mSampleRate: f64::from(RATE),
+            mFormatID: u32::from_be_bytes(*b"aac "),
+            mFramesPerPacket: AAC_PACKET_SAMPLES as u32,
+            mChannelsPerFrame: CHANNELS as u32,
+            ..Default::default()
+        };
         let mut converter: AudioConverterRef = null();
         // SAFETY: as Ac3Decoder::new.
         let max_packet = unsafe {
@@ -301,10 +328,14 @@ impl AacEncoder {
             }
             let mut n = 1u32;
             let mut desc = AudioStreamPacketDescription::default();
-            let mut list = AudioBufferList { mNumberBuffers: 1, mBuffers: [AudioBuffer { mNumberChannels: CHANNELS as u32, mDataByteSize: buf.len() as u32, mData: buf.as_mut_ptr().cast() }] };
+            let mut list = AudioBufferList {
+                mNumberBuffers: 1,
+                mBuffers: [AudioBuffer { mNumberChannels: CHANNELS as u32, mDataByteSize: buf.len() as u32, mData: buf.as_mut_ptr().cast() }],
+            };
             self.fifo.taken = 0;
             // SAFETY: the FIFO is boxed and outlives the call; the output list points at `buf`.
-            let st = unsafe { AudioConverterFillComplexBuffer(self.converter, feed_pcm, (&raw mut *self.fifo).cast(), &raw mut n, &raw mut list, &raw mut desc) };
+            let st =
+                unsafe { AudioConverterFillComplexBuffer(self.converter, feed_pcm, (&raw mut *self.fifo).cast(), &raw mut n, &raw mut list, &raw mut desc) };
             let taken = self.fifo.taken;
             self.fifo.samples.drain(..taken);
             ensure!(st == 0 || st == NO_MORE_INPUT, "AAC encode: OSStatus {st}");

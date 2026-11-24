@@ -109,7 +109,14 @@ impl Decoder {
             let number = CFNumberCreate(null(), 3, (&raw const pixel).cast());
             let keys = [kCVPixelBufferPixelFormatTypeKey];
             let values = [number];
-            let attrs = CFDictionaryCreate(null(), keys.as_ptr(), values.as_ptr(), 1, &raw const kCFTypeDictionaryKeyCallBacks, &raw const kCFTypeDictionaryValueCallBacks);
+            let attrs = CFDictionaryCreate(
+                null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
+            );
             let st = VTDecompressionSessionCreate(null(), format, null(), attrs, &raw const record, &raw mut session);
             CFRelease(attrs);
             CFRelease(number);
@@ -131,7 +138,11 @@ impl Decoder {
             let st = CMBlockBufferCreateWithMemoryBlock(null(), null_mut(), data.len(), null(), null(), 0, data.len(), 0, &raw mut block);
             ensure!(st == 0, "block buffer: OSStatus {st}");
             CMBlockBufferReplaceDataBytes(data.as_ptr().cast(), block, 0, data.len());
-            let timing = CMSampleTimingInfo { duration: CMTime::INVALID, presentationTimeStamp: CMTime::new(pts, self.timescale), decodeTimeStamp: CMTime::new(dts, self.timescale) };
+            let timing = CMSampleTimingInfo {
+                duration: CMTime::INVALID,
+                presentationTimeStamp: CMTime::new(pts, self.timescale),
+                decodeTimeStamp: CMTime::new(dts, self.timescale),
+            };
             let size = data.len();
             let mut sample: CMSampleBufferRef = null();
             let st = CMSampleBufferCreateReady(null(), block, self.format, 1, 1, &raw const timing, 1, &raw const size, &raw mut sample);
@@ -256,8 +267,26 @@ impl Encoder {
         unsafe {
             let spec_keys = [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder];
             let spec_values = [kCFBooleanTrue];
-            let spec = CFDictionaryCreate(null(), spec_keys.as_ptr(), spec_values.as_ptr(), 1, &raw const kCFTypeDictionaryKeyCallBacks, &raw const kCFTypeDictionaryValueCallBacks);
-            let st = VTCompressionSessionCreate(null(), width as i32, height as i32, CODEC_HEVC, spec, null(), null(), on_encoded, (&raw mut *sink).cast(), &raw mut session);
+            let spec = CFDictionaryCreate(
+                null(),
+                spec_keys.as_ptr(),
+                spec_values.as_ptr(),
+                1,
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
+            );
+            let st = VTCompressionSessionCreate(
+                null(),
+                width as i32,
+                height as i32,
+                CODEC_HEVC,
+                spec,
+                null(),
+                null(),
+                on_encoded,
+                (&raw mut *sink).cast(),
+                &raw mut session,
+            );
             CFRelease(spec);
             ensure!(st == 0, "HEVC encoder: OSStatus {st}");
             let number_i64 = |v: i64| CFNumberCreate(null(), CF_NUMBER_SINT64, (&raw const v).cast());
@@ -289,7 +318,14 @@ impl Encoder {
             VTCompressionSessionPrepareToEncodeFrames(session);
             let keys = [kVTEncodeFrameOptionKey_ForceKeyFrame];
             let values = [kCFBooleanTrue];
-            let force_key = CFDictionaryCreate(null(), keys.as_ptr(), values.as_ptr(), 1, &raw const kCFTypeDictionaryKeyCallBacks, &raw const kCFTypeDictionaryValueCallBacks);
+            let force_key = CFDictionaryCreate(
+                null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
+            );
             Ok(Self { session, sink, timescale, force_key })
         }
     }
@@ -400,5 +436,3 @@ mod tests {
         }
     }
 }
-
-

@@ -55,7 +55,10 @@ impl Playlist {
         let skip = self.window.map_or(0, |w| self.segments.len().saturating_sub(w));
         let kind = if self.window.is_some() { "" } else { "#EXT-X-PLAYLIST-TYPE:EVENT\n" };
         let map = if self.window.is_some() { "URI=\"init.mp4\"".to_string() } else { format!("URI=\"media.mp4\",BYTERANGE=\"{}@0\"", self.init_len) };
-        let mut s = format!("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{}\n#EXT-X-MEDIA-SEQUENCE:{skip}\n{kind}#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:{map}\n", self.target);
+        let mut s = format!(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{}\n#EXT-X-MEDIA-SEQUENCE:{skip}\n{kind}#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:{map}\n",
+            self.target
+        );
         for (secs, loc) in &self.segments[skip..] {
             match loc {
                 Loc::Range { off, len } => s.push_str(&format!("#EXTINF:{secs:.6},\n#EXT-X-BYTERANGE:{len}@{off}\nmedia.mp4\n")),
@@ -98,7 +101,14 @@ impl HlsWriter {
                 (None, Some(segments))
             }
         };
-        let w = Self { dir: dir.to_path_buf(), layout, media, written: init.len() as u64, playlist: Playlist::new(init.len() as u64, target_secs, window), sequence: 0 };
+        let w = Self {
+            dir: dir.to_path_buf(),
+            layout,
+            media,
+            written: init.len() as u64,
+            playlist: Playlist::new(init.len() as u64, target_secs, window),
+            sequence: 0,
+        };
         w.write_playlist()?;
         Ok(w)
     }
@@ -183,7 +193,8 @@ mod window_tests {
         assert_eq!(pl.matches("#EXTINF").count(), 3);
         assert!(pl.contains("seg00012.m4s") && pl.contains("seg00014.m4s") && !pl.contains("PLAYLIST-TYPE"));
         // Listed (12–14) plus the grace of two (10, 11); older ones gone.
-        let mut files: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".m4s")).collect();
+        let mut files: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".m4s")).collect();
         files.sort();
         assert_eq!(files, ["seg00010.m4s", "seg00011.m4s", "seg00012.m4s", "seg00013.m4s", "seg00014.m4s"]);
         assert!(dir.join("init.mp4").exists() && !dir.join("media.mp4").exists());
@@ -232,4 +243,3 @@ fn range(r: &str) -> Option<(u64, u64)> {
     let (len, off) = r.split_once('@')?;
     Some((off.trim().parse().ok()?, len.trim().parse().ok()?))
 }
-

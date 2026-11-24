@@ -1,7 +1,6 @@
 //! Decoding for analysis: HEVC pictures shrunk to small luma images (VideoToolbox, in hardware) and AAC folded
 //! to one channel (AudioToolbox). Plain FFI to their C APIs, kept to the few calls these need; every `unsafe` block is here.
 
-
 use anyhow::{anyhow, ensure};
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
@@ -97,13 +96,28 @@ fn shrink(src: &[u8], w: usize, h: usize, stride: usize, dw: usize, dh: usize, v
 impl HevcDecoder {
     /// A decoder for a track's parameter sets (VPS, SPS, PPS), handing back `width`×`height` pictures for the
     /// presentation times `want` accepts.
-    pub fn new(parameter_sets: &[Vec<u8>], nal_length_size: u8, timescale: u32, width: usize, height: usize, want: Box<dyn FnMut(i64) -> bool + Send>) -> anyhow::Result<Self> {
+    pub fn new(
+        parameter_sets: &[Vec<u8>],
+        nal_length_size: u8,
+        timescale: u32,
+        width: usize,
+        height: usize,
+        want: Box<dyn FnMut(i64) -> bool + Send>,
+    ) -> anyhow::Result<Self> {
         let ptrs: Vec<*const u8> = parameter_sets.iter().map(|p| p.as_ptr()).collect();
         let sizes: Vec<usize> = parameter_sets.iter().map(Vec::len).collect();
         let mut format: CMFormatDescriptionRef = null();
         // SAFETY: the pointer and size arrays describe live slices; format is an out-parameter.
         let st = unsafe {
-            CMVideoFormatDescriptionCreateFromHEVCParameterSets(null(), ptrs.len(), ptrs.as_ptr(), sizes.as_ptr(), i32::from(nal_length_size), null(), &raw mut format)
+            CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                null(),
+                ptrs.len(),
+                ptrs.as_ptr(),
+                sizes.as_ptr(),
+                i32::from(nal_length_size),
+                null(),
+                &raw mut format,
+            )
         };
         ensure!(st == 0, "HEVC format description: OSStatus {st}");
         let mut sink = Box::new(Sink { width, height, want, out: Vec::new(), error: None });
@@ -116,7 +130,14 @@ impl HevcDecoder {
             let number = CFNumberCreate(null(), CF_NUMBER_SINT32, (&raw const pixel).cast());
             let keys = [kCVPixelBufferPixelFormatTypeKey];
             let values = [number];
-            let attrs = CFDictionaryCreate(null(), keys.as_ptr(), values.as_ptr(), 1, &raw const kCFTypeDictionaryKeyCallBacks, &raw const kCFTypeDictionaryValueCallBacks);
+            let attrs = CFDictionaryCreate(
+                null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
+            );
             let st = VTDecompressionSessionCreate(null(), format, null(), attrs, &raw const record, &raw mut session);
             CFRelease(attrs);
             CFRelease(number);
@@ -143,7 +164,11 @@ impl HevcDecoder {
                 CFRelease(block);
                 return Err(anyhow!("block buffer copy: OSStatus {st}"));
             }
-            let timing = CMSampleTimingInfo { duration: CMTime::INVALID, presentationTimeStamp: CMTime::new(pts, self.timescale), decodeTimeStamp: CMTime::new(dts, self.timescale) };
+            let timing = CMSampleTimingInfo {
+                duration: CMTime::INVALID,
+                presentationTimeStamp: CMTime::new(pts, self.timescale),
+                decodeTimeStamp: CMTime::new(dts, self.timescale),
+            };
             let size = data.len();
             let mut sample: CMSampleBufferRef = null();
             let st = CMSampleBufferCreateReady(null(), block, self.format, 1, 1, &raw const timing, 1, &raw const size, &raw mut sample);
@@ -195,7 +220,13 @@ struct Pending<'a> {
     description: AudioStreamPacketDescription,
 }
 
-extern "C" fn feed(_c: AudioConverterRef, packets: *mut u32, data: *mut AudioBufferList, desc: *mut *mut AudioStreamPacketDescription, user: *mut c_void) -> OSStatus {
+extern "C" fn feed(
+    _c: AudioConverterRef,
+    packets: *mut u32,
+    data: *mut AudioBufferList,
+    desc: *mut *mut AudioStreamPacketDescription,
+    user: *mut c_void,
+) -> OSStatus {
     // SAFETY: user is the Pending passed to FillComplexBuffer below, alive for that call; the other pointers are
     // the converter's own out-parameters for this call.
     unsafe {
@@ -269,7 +300,11 @@ impl AacDecoder {
         let mut frames = frames_capacity;
         let mut list = AudioBufferList {
             mNumberBuffers: 1,
-            mBuffers: [AudioBuffer { mNumberChannels: self.channels as u32, mDataByteSize: (self.buffer.len() * 4) as u32, mData: self.buffer.as_mut_ptr().cast() }],
+            mBuffers: [AudioBuffer {
+                mNumberChannels: self.channels as u32,
+                mDataByteSize: (self.buffer.len() * 4) as u32,
+                mData: self.buffer.as_mut_ptr().cast(),
+            }],
         };
         // SAFETY: the input callback gets `pending` (alive for the call); the output list points at our buffer,
         // sized to `frames` frames.

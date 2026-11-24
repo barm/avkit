@@ -2,7 +2,6 @@
 //! and the HLS playlist that addresses it by byte range, the form every recording takes. Pure Rust; the native
 //! pipeline (#119) hands it encoded samples.
 
-
 /// The video track: HEVC, its `hvcC` box body as the encoder describes it.
 #[derive(Clone, Debug)]
 pub struct VideoTrack {
@@ -206,8 +205,8 @@ pub fn fragment(sequence: u32, video: &Run, audio: Option<&Run>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::read::{self as mp4, TrackKind};
     use crate::hls::{HlsWriter, parse};
+    use crate::read::{self as mp4, TrackKind};
     use std::path::Path;
 
     const MEDIA: &[u8] = include_bytes!("../tests/fixtures/media.mp4");
@@ -220,7 +219,13 @@ mod tests {
         let a = init.track(|k| matches!(k, TrackKind::Aac { .. })).unwrap().clone();
         let TrackKind::Hevc { width, height, hvcc, .. } = v.kind.clone() else { unreachable!() };
         let TrackKind::Aac { channels, sample_rate, esds } = a.kind.clone() else { unreachable!() };
-        let mut w = HlsWriter::create(dir, &init_segment(&VideoTrack { width, height, timescale: v.timescale, hvcc }, Some(&AudioTrack { channels, sample_rate, esds })), 1, crate::hls::Layout::SingleFile).unwrap();
+        let mut w = HlsWriter::create(
+            dir,
+            &init_segment(&VideoTrack { width, height, timescale: v.timescale, hvcc }, Some(&AudioTrack { channels, sample_rate, esds })),
+            1,
+            crate::hls::Layout::SingleFile,
+        )
+        .unwrap();
         let mut per_frag = Vec::new();
         for (off, len, secs) in FRAGS {
             let bytes = &MEDIA[off..off + len];

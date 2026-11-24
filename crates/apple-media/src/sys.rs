@@ -191,7 +191,6 @@ unsafe extern "C" {
     pub fn AudioConverterDispose(converter: AudioConverterRef) -> OSStatus;
 }
 
-
 // ---- more CoreFoundation / CoreMedia / VideoToolbox for full-frame decoding and encoding ----
 
 pub type CFDataRef = *const c_void;
@@ -224,7 +223,14 @@ unsafe extern "C" {
         nal_unit_header_length: i32,
         out: *mut CMFormatDescriptionRef,
     ) -> OSStatus;
-    pub fn CMVideoFormatDescriptionCreate(alloc: CFAllocatorRef, codec: u32, width: i32, height: i32, extensions: CFDictionaryRef, out: *mut CMFormatDescriptionRef) -> OSStatus;
+    pub fn CMVideoFormatDescriptionCreate(
+        alloc: CFAllocatorRef,
+        codec: u32,
+        width: i32,
+        height: i32,
+        extensions: CFDictionaryRef,
+        out: *mut CMFormatDescriptionRef,
+    ) -> OSStatus;
     pub fn CMSampleBufferGetDataBuffer(sample: CMSampleBufferRef) -> CMBlockBufferRef;
     pub fn CMSampleBufferGetFormatDescription(sample: CMSampleBufferRef) -> CMFormatDescriptionRef;
     pub fn CMSampleBufferGetPresentationTimeStamp(sample: CMSampleBufferRef) -> CMTime;
@@ -321,7 +327,13 @@ pub type CVPixelBufferPoolRef = *const c_void;
 
 #[link(name = "CoreVideo", kind = "framework")]
 unsafe extern "C" {
-    pub fn CVMetalTextureCacheCreate(alloc: CFAllocatorRef, cache_attrs: CFDictionaryRef, device: *mut c_void, texture_attrs: CFDictionaryRef, out: *mut CVMetalTextureCacheRef) -> i32;
+    pub fn CVMetalTextureCacheCreate(
+        alloc: CFAllocatorRef,
+        cache_attrs: CFDictionaryRef,
+        device: *mut c_void,
+        texture_attrs: CFDictionaryRef,
+        out: *mut CVMetalTextureCacheRef,
+    ) -> i32;
     pub fn CVMetalTextureCacheCreateTextureFromImage(
         alloc: CFAllocatorRef,
         cache: CVMetalTextureCacheRef,
@@ -345,7 +357,12 @@ unsafe extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
-    pub fn CFDictionaryCreateMutable(alloc: CFAllocatorRef, capacity: isize, key_cb: *const CFDictionaryCallBacks, value_cb: *const CFDictionaryCallBacks) -> CFDictionaryRef;
+    pub fn CFDictionaryCreateMutable(
+        alloc: CFAllocatorRef,
+        capacity: isize,
+        key_cb: *const CFDictionaryCallBacks,
+        value_cb: *const CFDictionaryCallBacks,
+    ) -> CFDictionaryRef;
     pub fn CFDictionarySetValue(dict: CFDictionaryRef, key: CFTypeRef, value: CFTypeRef);
 }
 

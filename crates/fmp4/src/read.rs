@@ -17,9 +17,19 @@ pub struct Track {
 pub enum TrackKind {
     /// HEVC: the parameter sets (VPS, SPS, PPS, in that order) and the length of each NAL unit's size prefix.
     /// `hvcc` is the raw `hvcC` box body (for writing the track again).
-    Hevc { width: u16, height: u16, parameter_sets: Vec<Vec<u8>>, nal_length_size: u8, hvcc: Vec<u8> },
+    Hevc {
+        width: u16,
+        height: u16,
+        parameter_sets: Vec<Vec<u8>>,
+        nal_length_size: u8,
+        hvcc: Vec<u8>,
+    },
     /// AAC: channels, sample rate, and the `esds` payload (the decoder's "magic cookie").
-    Aac { channels: u16, sample_rate: u32, esds: Vec<u8> },
+    Aac {
+        channels: u16,
+        sample_rate: u32,
+        esds: Vec<u8>,
+    },
     Other,
 }
 

@@ -5,15 +5,15 @@
 //! `bwdif=mode=send_field`), or one per frame. Decoded pixel buffers are read as Metal textures in place
 //! (CoreVideo's texture cache); output goes to buffers from a pool, ready for the encoder.
 
+use anyhow::{Context, anyhow, ensure};
 use apple_media::sys::*;
 use apple_media::video::PixelBuffer;
-use anyhow::{Context, anyhow, ensure};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
-    MTLSize, MTLTexture,
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLLibrary, MTLSize, MTLTexture,
 };
 use std::ffi::c_void;
 use std::ptr::{NonNull, null};

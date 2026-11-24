@@ -304,7 +304,8 @@ mod tests {
         }
         units.extend(d.flush());
         assert_eq!(d.streams(), (Some(VideoCodec::Mpeg2), Some(AudioCodec::Ac3)));
-        let video: Vec<_> = units.iter().filter_map(|u| if let Unit::Video { pts, dts, data, .. } = u { Some((*pts, *dts, data.len())) } else { None }).collect();
+        let video: Vec<_> =
+            units.iter().filter_map(|u| if let Unit::Video { pts, dts, data, .. } = u { Some((*pts, *dts, data.len())) } else { None }).collect();
         let audio: Vec<_> = units.iter().filter_map(|u| if let Unit::Audio { pts, data, .. } = u { Some((*pts, data.len())) } else { None }).collect();
         // ffprobe finds 7 pictures in this slice. The audio is one PES of five AC-3 frames (this broadcaster packs
         // them; ffprobe counts frames), cut short at the end of the slice.

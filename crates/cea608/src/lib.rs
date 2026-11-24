@@ -61,10 +61,12 @@ fn basic(c: u8) -> char {
 const SPECIAL: [char; 16] = ['®', '°', '½', '¿', '™', '¢', '£', '♪', 'à', ' ', 'è', 'â', 'ê', 'î', 'ô', 'û'];
 /// Extended characters (`0x12`/`0x13 0x20..=0x3f`); each replaces the character before it.
 const EXTENDED_12: [char; 32] = [
-    'Á', 'É', 'Ó', 'Ú', 'Ü', 'ü', '‘', '¡', '*', '\'', '—', '©', '℠', '•', '“', '”', 'À', 'Â', 'Ç', 'È', 'Ê', 'Ë', 'ë', 'Î', 'Ï', 'ï', 'Ô', 'Ù', 'ù', 'Û', '«', '»',
+    'Á', 'É', 'Ó', 'Ú', 'Ü', 'ü', '‘', '¡', '*', '\'', '—', '©', '℠', '•', '“', '”', 'À', 'Â', 'Ç', 'È', 'Ê', 'Ë', 'ë', 'Î', 'Ï', 'ï', 'Ô', 'Ù', 'ù', 'Û', '«',
+    '»',
 ];
 const EXTENDED_13: [char; 32] = [
-    'Ã', 'ã', 'Í', 'Ì', 'ì', 'Ò', 'ò', 'Õ', 'õ', '{', '}', '\\', '^', '_', '|', '~', 'Ä', 'ä', 'Ö', 'ö', 'ß', '¥', '¤', '¦', 'Å', 'å', 'Ø', 'ø', '┌', '┐', '└', '┘',
+    'Ã', 'ã', 'Í', 'Ì', 'ì', 'Ò', 'ò', 'Õ', 'õ', '{', '}', '\\', '^', '_', '|', '~', 'Ä', 'ä', 'Ö', 'ö', 'ß', '¥', '¤', '¦', 'Å', 'å', 'Ø', 'ø', '┌', '┐', '└',
+    '┘',
 ];
 
 impl Decoder {
@@ -254,7 +256,9 @@ pub fn parse_vtt(text: &str) -> Vec<Cue> {
         let lines: Vec<&str> = block.lines().collect();
         let Some(at) = lines.iter().position(|l| l.contains("-->")) else { continue };
         let mut times = lines[at].split("-->");
-        let (Some(a), Some(b)) = (times.next().and_then(seconds), times.next().and_then(|b| seconds(b.split_whitespace().next().unwrap_or("")))) else { continue };
+        let (Some(a), Some(b)) = (times.next().and_then(seconds), times.next().and_then(|b| seconds(b.split_whitespace().next().unwrap_or("")))) else {
+            continue;
+        };
         let text = lines[at + 1..].join("\n");
         if !text.trim().is_empty() {
             cues.push(Cue { start: a, end: b, text });
