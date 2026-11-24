@@ -48,10 +48,12 @@ pub struct Sample {
     /// Where its bytes are, in the buffer the fragment was read from.
     pub offset: usize,
     pub size: usize,
+    /// How long it lasts, in the track's timescale.
+    pub duration: u32,
 }
 
 /// The boxes at the top level of `data` (or inside a box's body): (type, body start, body end).
-fn boxes(data: &[u8], start: usize, end: usize) -> anyhow::Result<Vec<([u8; 4], usize, usize)>> {
+pub(crate) fn boxes(data: &[u8], start: usize, end: usize) -> anyhow::Result<Vec<([u8; 4], usize, usize)>> {
     let mut out = Vec::new();
     let mut at = start;
     while at + 8 <= end {
@@ -258,7 +260,7 @@ fn parse_traf(init: &Init, d: &[u8], moof_start: usize, s: usize, e: usize, out:
             if start + ssize as usize > d.len() {
                 bail!("sample data runs past the fragment");
             }
-            out.push(Sample { track, dts, pts: dts + cts, offset: start, size: ssize as usize });
+            out.push(Sample { track, dts, pts: dts + cts, offset: start, size: ssize as usize, duration: sdur });
             offset += i64::from(ssize);
             dts += i64::from(sdur);
         }

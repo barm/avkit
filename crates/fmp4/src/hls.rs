@@ -127,6 +127,15 @@ impl HlsWriter {
         self.write_playlist()
     }
 
+    /// Append a fragment already in its final form (`moof` + `mdat`, as `write::fragment` makes) to the single file.
+    pub fn append_fragment(&mut self, secs: f64, frag: &[u8]) -> std::io::Result<()> {
+        let media = self.media.as_mut().ok_or_else(|| std::io::Error::other("only a single-file layout takes raw fragments"))?;
+        media.write_all(frag)?;
+        self.playlist.push(secs, Loc::Range { off: self.written, len: frag.len() as u64 });
+        self.written += frag.len() as u64;
+        self.write_playlist()
+    }
+
     /// Seconds written so far.
     pub fn duration(&self) -> f64 {
         self.playlist.duration()

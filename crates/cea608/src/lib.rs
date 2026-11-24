@@ -242,6 +242,41 @@ impl VttWriter {
     }
 }
 
+/// `MM:SS.mmm` or `HH:MM:SS.mmm` as seconds.
+fn seconds(t: &str) -> Option<f64> {
+    t.trim().split(':').try_fold(0.0, |acc, part| Some(acc * 60.0 + part.parse::<f64>().ok()?))
+}
+
+/// The cues of a WebVTT file (as `VttWriter` writes them; cue settings are ignored).
+pub fn parse_vtt(text: &str) -> Vec<Cue> {
+    let mut cues = Vec::new();
+    for block in text.replace('\r', "").split("\n\n") {
+        let lines: Vec<&str> = block.lines().collect();
+        let Some(at) = lines.iter().position(|l| l.contains("-->")) else { continue };
+        let mut times = lines[at].split("-->");
+        let (Some(a), Some(b)) = (times.next().and_then(seconds), times.next().and_then(|b| seconds(b.split_whitespace().next().unwrap_or("")))) else { continue };
+        let text = lines[at + 1..].join("\n");
+        if !text.trim().is_empty() {
+            cues.push(Cue { start: a, end: b, text });
+        }
+    }
+    cues
+}
+
+/// The cues as they fall on a timeline from which `removed` stretches ((start, length), in order) were cut out:
+/// moved back by what was removed before them, and dropped if they began inside a removed stretch.
+pub fn cut_cues(cues: &[Cue], removed: &[(f64, f64)]) -> Vec<Cue> {
+    let before = |t: f64| removed.iter().filter(|r| r.0 + r.1 <= t).map(|r| r.1).sum::<f64>();
+    cues.iter()
+        .filter(|c| !removed.iter().any(|r| c.start >= r.0 && c.start < r.0 + r.1))
+        .map(|c| {
+            // A cue running into a removed stretch ends where it starts.
+            let end = removed.iter().find(|r| c.start < r.0 && c.end > r.0).map_or(c.end, |r| r.0);
+            Cue { start: c.start - before(c.start), end: end - before(end.min(c.end)), text: c.text.clone() }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +322,23 @@ mod tests {
         d.push(0x11, 0x37, 0.0); // ♪
         d.push(0x14, 0x2c, 1.0);
         assert_eq!(d.take()[0].text, "CAÉ♪");
+    }
+
+    #[test]
+    fn reads_back_what_it_writes_and_cuts_out_stretches() {
+        let dir = std::env::temp_dir().join(format!("cea608-vtt-{}.vtt", std::process::id()));
+        let cues = vec![
+            Cue { start: 1.0, end: 2.0, text: "BEFORE".into() },
+            Cue { start: 10.5, end: 11.0, text: "IN THE BREAK".into() },
+            Cue { start: 25.0, end: 27.5, text: "AFTER\nTWO LINES".into() },
+        ];
+        let mut w = VttWriter::create(&dir).unwrap();
+        w.write(&cues).unwrap();
+        let back = parse_vtt(&std::fs::read_to_string(&dir).unwrap());
+        assert_eq!(back, cues);
+        let cut = cut_cues(&back, &[(10.0, 12.0)]);
+        assert_eq!(cut, vec![Cue { start: 1.0, end: 2.0, text: "BEFORE".into() }, Cue { start: 13.0, end: 15.5, text: "AFTER\nTWO LINES".into() }]);
+        let _ = std::fs::remove_file(dir);
     }
 
     #[test]
