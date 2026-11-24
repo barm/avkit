@@ -2,6 +2,8 @@
 //! plus the captions the video carries (ATSC A/53 `cc_data` in the MPEG-2 picture user data). Fed bytes as they
 //! arrive, in any chunking.
 
+#![forbid(unsafe_code)]
+
 pub mod h264;
 pub mod mpeg2;
 

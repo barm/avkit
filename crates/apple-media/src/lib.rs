@@ -8,4 +8,5 @@ pub mod analysis;
 pub mod audio;
 mod outbox;
 pub mod sys;
+pub mod thread;
 pub mod video;

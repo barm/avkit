@@ -7,6 +7,7 @@ description = "Broadcast media with VideoToolbox and AudioToolbox: MPEG-2 decode
 
 [dependencies]
 anyhow = "1"
+libc = "0.2"
 
 [dev-dependencies]
 mpegts = { path = "../mpegts" }

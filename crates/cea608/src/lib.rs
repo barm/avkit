@@ -1,6 +1,8 @@
 //! Broadcast captions (CEA-608, channel CC1, as carried in ATSC A/53 `cc_data`) to WebVTT cues. Pop-on captions
 //! become a cue when they are shown; roll-up and paint-on text becomes a cue as each line completes.
 
+#![forbid(unsafe_code)]
+
 use std::fmt::Write as _;
 use std::io::Write;
 
