@@ -1,0 +1,8 @@
+[package]
+name = "mpegts"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A small MPEG transport stream demuxer for ATSC broadcasts: video, main audio and A/53 captions, with timestamps."
+
+[dependencies]

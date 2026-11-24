@@ -1,0 +1,11 @@
+[package]
+name = "cea608"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "CEA-608 broadcast captions (CC1) to WebVTT: pop-on, roll-up and paint-on."
+
+[dependencies]
+
+[dev-dependencies]
+mpegts = { path = "../mpegts" }

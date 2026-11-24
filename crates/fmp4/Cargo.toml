@@ -1,0 +1,9 @@
+[package]
+name = "fmp4"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Fragmented MP4 (HEVC + AAC) and byte-range HLS playlists: read and write the single-file form."
+
+[dependencies]
+anyhow = "1"

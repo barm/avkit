@@ -1,0 +1,12 @@
+[package]
+name = "apple-media"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Broadcast media with VideoToolbox and AudioToolbox: MPEG-2 decode, HEVC encode, AC-3 decode, AAC encode."
+
+[dependencies]
+anyhow = "1"
+
+[dev-dependencies]
+mpegts = { path = "../mpegts" }
