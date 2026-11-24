@@ -228,6 +228,14 @@ extern "C" fn on_encoded(refcon: *mut c_void, _f: *mut c_void, status: OSStatus,
     }
 }
 
+/// How hard the encoder squeezes: an average bitrate, or a constant quality (0.0-1.0) that spends bits where the
+/// picture needs them, so a static newsroom is small and a football game keeps its detail.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Rate {
+    Bitrate(i64),
+    Quality(f32),
+}
+
 /// HEVC in hardware: no B-frames (decode order is presentation order), a keyframe whenever asked and at least
 /// every `max_key_secs`.
 pub struct Encoder {
@@ -240,7 +248,7 @@ pub struct Encoder {
 unsafe impl Send for Encoder {}
 
 impl Encoder {
-    pub fn new(width: u32, height: u32, bitrate: i64, fps: f64, max_key_secs: f64, realtime: bool, timescale: u32) -> anyhow::Result<Self> {
+    pub fn new(width: u32, height: u32, rate: Rate, fps: f64, max_key_secs: f64, realtime: bool, timescale: u32) -> anyhow::Result<Self> {
         let mut sink = Box::new(EncodeSink { out: Vec::new(), error: None, hvcc: None });
         let mut session: VTCompressionSessionRef = null();
         // SAFETY: the dictionaries and numbers are created, used and released here; session is an out-parameter
@@ -254,6 +262,10 @@ impl Encoder {
             ensure!(st == 0, "HEVC encoder: OSStatus {st}");
             let number_i64 = |v: i64| CFNumberCreate(null(), CF_NUMBER_SINT64, (&raw const v).cast());
             let number_f64 = |v: f64| CFNumberCreate(null(), CF_NUMBER_FLOAT64, (&raw const v).cast());
+            let (rate_key, rate_value) = match rate {
+                Rate::Bitrate(bps) => (kVTCompressionPropertyKey_AverageBitRate, number_i64(bps)),
+                Rate::Quality(q) => (kVTCompressionPropertyKey_Quality, number_f64(f64::from(q.clamp(0.0, 1.0)))),
+            };
             let set = |k: CFStringRef, v: CFTypeRef, release: bool| {
                 let st = VTSessionSetProperty(session, k, v);
                 if release {
@@ -265,7 +277,7 @@ impl Encoder {
                 set(kVTCompressionPropertyKey_RealTime, if realtime { kCFBooleanTrue } else { kCFBooleanFalse }, false),
                 set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel, false),
                 set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, false),
-                set(kVTCompressionPropertyKey_AverageBitRate, number_i64(bitrate), true),
+                set(rate_key, rate_value, true),
                 set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, number_f64(max_key_secs), true),
                 set(kVTCompressionPropertyKey_ExpectedFrameRate, number_f64(fps), true),
             ];
@@ -361,29 +373,31 @@ mod tests {
         eprintln!("fed {fed} pictures, got {} of {size:?}", pictures.len());
         assert!(pictures.len() + 3 >= fed && !pictures.is_empty());
 
-        // And encode them to HEVC, a keyframe every 2 s.
+        // And encode them to HEVC, a keyframe every 2 s, at an average bitrate and at constant quality.
         pictures.sort_by_key(|p| p.pts);
-        let mut enc = Encoder::new(size.0 as u32, size.1 as u32, 4_000_000, 30.0, 2.0, false, 90_000).unwrap();
-        let t0 = std::time::Instant::now();
-        let origin = pictures[0].pts;
-        let mut out = Vec::new();
-        let mut next_key = 0;
-        for (i, p) in pictures.iter().enumerate() {
-            let pts = p.pts - origin;
-            let dur = pictures.get(i + 1).map_or(1500, |n| n.pts - p.pts);
-            let key = pts >= next_key;
-            if key {
-                next_key += 180_000;
+        for rate in [Rate::Bitrate(4_000_000), Rate::Quality(0.6)] {
+            let mut enc = Encoder::new(size.0 as u32, size.1 as u32, rate, 30.0, 2.0, false, 90_000).unwrap();
+            let t0 = std::time::Instant::now();
+            let origin = pictures[0].pts;
+            let mut out = Vec::new();
+            let mut next_key = 0;
+            for (i, p) in pictures.iter().enumerate() {
+                let pts = p.pts - origin;
+                let dur = pictures.get(i + 1).map_or(1500, |n| n.pts - p.pts);
+                let key = pts >= next_key;
+                if key {
+                    next_key += 180_000;
+                }
+                out.extend(enc.encode(&p.picture, pts, dur, key).unwrap());
             }
-            out.extend(enc.encode(&p.picture, pts, dur, key).unwrap());
+            out.extend(enc.finish().unwrap());
+            let bytes: usize = out.iter().map(|e| e.data.len()).sum();
+            let keys = out.iter().filter(|e| e.keyframe).count();
+            eprintln!("{rate:?}: encoded {} pictures, {} keyframes, {:.1} Mbit/s, in {:?}", out.len(), keys, bytes as f64 * 8.0 / 10.0 / 1e6, t0.elapsed());
+            assert_eq!(out.len(), pictures.len());
+            assert!(enc.hvcc().is_some_and(|h| h.len() > 23));
+            assert!(out.windows(2).all(|w| w[1].dts > w[0].dts && w[0].pts == w[0].dts), "no reordering");
         }
-        out.extend(enc.finish().unwrap());
-        let bytes: usize = out.iter().map(|e| e.data.len()).sum();
-        let keys = out.iter().filter(|e| e.keyframe).count();
-        eprintln!("encoded {} pictures, {} keyframes, {:.1} Mbit/s, in {:?}", out.len(), keys, bytes as f64 * 8.0 / 10.0 / 1e6, t0.elapsed());
-        assert_eq!(out.len(), pictures.len());
-        assert!(enc.hvcc().is_some_and(|h| h.len() > 23));
-        assert!(out.windows(2).all(|w| w[1].dts > w[0].dts && w[0].pts == w[0].dts), "no reordering");
     }
 }
 

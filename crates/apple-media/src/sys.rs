@@ -272,6 +272,7 @@ unsafe extern "C" {
     pub fn VTSessionSetProperty(session: CFTypeRef, key: CFStringRef, value: CFTypeRef) -> OSStatus;
     pub static kVTCompressionPropertyKey_RealTime: CFStringRef;
     pub static kVTCompressionPropertyKey_AverageBitRate: CFStringRef;
+    pub static kVTCompressionPropertyKey_Quality: CFStringRef;
     pub static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
     pub static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
     pub static kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: CFStringRef;
