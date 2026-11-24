@@ -8,6 +8,12 @@ description = "Broadcast media with VideoToolbox and AudioToolbox: MPEG-2 decode
 [dependencies]
 anyhow = "1"
 libc = "0.2"
+objc2-audio-toolbox = "0.3.2"
+objc2-core-audio-types = "0.3"
+objc2-core-foundation = "0.3.2"
+objc2-core-media = "0.3.2"
+objc2-core-video = "0.3.2"
+objc2-video-toolbox = "0.3.2"
 
 [dev-dependencies]
 mpegts = { path = "../mpegts" }

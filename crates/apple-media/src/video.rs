@@ -1,49 +1,32 @@
 //! Full-frame video with VideoToolbox: decoding broadcast video into pixel buffers (MPEG-2 has no hardware decoder
-//! on Apple Silicon, but VideoToolbox's software one works) and encoding them to HEVC in hardware.
+//! on Apple Silicon, but VideoToolbox's software one works) and encoding them to HEVC in hardware. Safe code over
+//! the sessions in `vt`.
 
-use crate::sys::*;
-use anyhow::{anyhow, ensure};
-use std::ffi::c_void;
-use std::ptr::{null, null_mut};
+use crate::vt::{self, CODEC_HEVC, Compression, Decompression, PIXEL_FORMAT_420V, keys, no, time, yes};
+use anyhow::anyhow;
+use objc2_core_foundation::{CFNumber, CFRetained};
+use objc2_core_media::CMFormatDescription;
+use objc2_core_video::{CVPixelBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth};
 
-use crate::outbox::{Outbox, sender};
+pub use crate::vt::CODEC_MPEG2;
 
-/// A retained CVPixelBuffer (a decoded picture), released on drop.
-pub struct PixelBuffer(CVImageBufferRef);
+/// A decoded picture (a retained CVPixelBuffer), released on drop.
+#[derive(Clone)]
+pub struct PixelBuffer(CFRetained<CVPixelBuffer>);
 
+// SAFETY: CoreVideo pixel buffers are reference-counted objects that may be passed between threads; we only read
+// them once decoded, and writers (the deinterlacer) hold the only reference to a buffer they fill.
 unsafe impl Send for PixelBuffer {}
 
 impl PixelBuffer {
-    /// Take a +1 reference.
-    /// SAFETY: `pb` must be a valid CVPixelBuffer.
-    pub(crate) unsafe fn retain(pb: CVImageBufferRef) -> Self {
-        unsafe { CFRetain(pb) };
-        Self(pb)
+    pub fn new(buffer: CFRetained<CVPixelBuffer>) -> Self {
+        Self(buffer)
     }
-    /// Own a +1 reference created elsewhere (a pool's new buffer).
-    pub fn adopt(pb: CVImageBufferRef) -> Self {
-        Self(pb)
-    }
-    pub fn raw(&self) -> CVImageBufferRef {
-        self.0
+    pub fn cv(&self) -> &CVPixelBuffer {
+        &self.0
     }
     pub fn size(&self) -> (usize, usize) {
-        // SAFETY: a live pixel buffer.
-        unsafe { (CVPixelBufferGetWidth(self.0), CVPixelBufferGetHeight(self.0)) }
-    }
-}
-
-impl Clone for PixelBuffer {
-    fn clone(&self) -> Self {
-        // SAFETY: a live pixel buffer; another reference to it.
-        unsafe { Self::retain(self.0) }
-    }
-}
-
-impl Drop for PixelBuffer {
-    fn drop(&mut self) {
-        // SAFETY: we hold one reference.
-        unsafe { CFRelease(self.0) };
+        (CVPixelBufferGetWidth(&self.0), CVPixelBufferGetHeight(&self.0))
     }
 }
 
@@ -53,135 +36,42 @@ pub struct Decoded {
     pub picture: PixelBuffer,
 }
 
-/// What the decoder's callback sends: a picture, or why one failed.
-type DecodeMsg = Result<Decoded, OSStatus>;
-
-extern "C" fn on_decoded(refcon: *mut c_void, _f: *mut c_void, status: OSStatus, _flags: u32, image: CVImageBufferRef, pts: CMTime, _d: CMTime) {
-    let msg = if status != 0 {
-        Err(status)
-    } else if image.is_null() {
-        return; // nothing decoded (a dropped frame)
-    } else {
-        // SAFETY: a valid pixel buffer for this call; retained to outlive it.
-        Ok(Decoded { pts: pts.value, picture: unsafe { PixelBuffer::retain(image) } })
-    };
-    // SAFETY: refcon is the decoder's outbox context, alive for the session's life.
-    let _ = unsafe { sender::<DecodeMsg>(refcon) }.send(msg);
-}
-
 /// Decodes broadcast MPEG-2 (or another codec VideoToolbox knows by its four-character code) into pixel buffers.
 pub struct Decoder {
-    session: VTDecompressionSessionRef,
-    format: CMFormatDescriptionRef,
-    outbox: Outbox<DecodeMsg>,
+    session: Decompression,
+    format: CFRetained<CMFormatDescription>,
     timescale: u32,
 }
 
-unsafe impl Send for Decoder {}
-
 impl Decoder {
     pub fn new(codec: u32, width: u32, height: u32, timescale: u32) -> anyhow::Result<Self> {
-        let mut format: CMFormatDescriptionRef = null();
-        // SAFETY: out-parameter.
-        let st = unsafe { CMVideoFormatDescriptionCreate(null(), codec, width as i32, height as i32, null(), &raw mut format) };
-        ensure!(st == 0, "video format description: OSStatus {st}");
-        Self::with_format(format, timescale)
+        Self::with_format(vt::video_format(codec, width, height)?, timescale)
     }
 
     /// An H.264 decoder for these parameter sets (NAL units without start codes); samples are then given as
     /// length-prefixed NAL units (4-byte lengths).
     pub fn h264(sps: &[u8], pps: &[u8], timescale: u32) -> anyhow::Result<Self> {
-        let ptrs = [sps.as_ptr(), pps.as_ptr()];
-        let sizes = [sps.len(), pps.len()];
-        let mut format: CMFormatDescriptionRef = null();
-        // SAFETY: the pointer and size arrays describe live slices; out-parameter.
-        let st = unsafe { CMVideoFormatDescriptionCreateFromH264ParameterSets(null(), 2, ptrs.as_ptr(), sizes.as_ptr(), 4, &raw mut format) };
-        ensure!(st == 0, "H.264 format description: OSStatus {st}");
-        Self::with_format(format, timescale)
+        Self::with_format(vt::h264_format(sps, pps)?, timescale)
     }
 
-    /// A decoder for a format description (taken over: released with the decoder).
-    fn with_format(format: CMFormatDescriptionRef, timescale: u32) -> anyhow::Result<Self> {
-        let outbox = Outbox::new();
-        let record = VTDecompressionOutputCallbackRecord { callback: on_decoded, refcon: outbox.context() };
-        let mut session: VTDecompressionSessionRef = null();
-        // SAFETY: as in mac.rs: attributes created and released here, record copied, session out-parameter.
-        let st = unsafe {
-            let pixel = 0x3432_3076i32; // 420v, what the encoder takes
-            let number = CFNumberCreate(null(), 3, (&raw const pixel).cast());
-            let keys = [kCVPixelBufferPixelFormatTypeKey];
-            let values = [number];
-            let attrs = CFDictionaryCreate(
-                null(),
-                keys.as_ptr(),
-                values.as_ptr(),
-                1,
-                &raw const kCFTypeDictionaryKeyCallBacks,
-                &raw const kCFTypeDictionaryValueCallBacks,
-            );
-            let st = VTDecompressionSessionCreate(null(), format, null(), attrs, &raw const record, &raw mut session);
-            CFRelease(attrs);
-            CFRelease(number);
-            st
-        };
-        if st != 0 {
-            // SAFETY: created above.
-            unsafe { CFRelease(format) };
-            return Err(anyhow!("video decoder: OSStatus {st}"));
-        }
-        Ok(Self { session, format, outbox, timescale })
+    fn with_format(format: CFRetained<CMFormatDescription>, timescale: u32) -> anyhow::Result<Self> {
+        // 420v: what the encoder takes.
+        let pixel = CFNumber::new_i32(PIXEL_FORMAT_420V as i32);
+        let attributes = vt::dict(&[(keys().pixel_format, &pixel)]);
+        let session = Decompression::new(&format, Some(attributes.as_ref()))?;
+        Ok(Self { session, format, timescale })
     }
 
     /// Decode one coded picture; returns the pictures that came out (in decode order: sort by `pts`).
     pub fn decode(&mut self, data: &[u8], dts: i64, pts: i64) -> anyhow::Result<Vec<Decoded>> {
-        // SAFETY: as HevcDecoder::decode in mac.rs.
-        unsafe {
-            let mut block: CMBlockBufferRef = null();
-            let st = CMBlockBufferCreateWithMemoryBlock(null(), null_mut(), data.len(), null(), null(), 0, data.len(), 0, &raw mut block);
-            ensure!(st == 0, "block buffer: OSStatus {st}");
-            CMBlockBufferReplaceDataBytes(data.as_ptr().cast(), block, 0, data.len());
-            let timing = CMSampleTimingInfo {
-                duration: CMTime::INVALID,
-                presentationTimeStamp: CMTime::new(pts, self.timescale),
-                decodeTimeStamp: CMTime::new(dts, self.timescale),
-            };
-            let size = data.len();
-            let mut sample: CMSampleBufferRef = null();
-            let st = CMSampleBufferCreateReady(null(), block, self.format, 1, 1, &raw const timing, 1, &raw const size, &raw mut sample);
-            CFRelease(block);
-            ensure!(st == 0, "sample buffer: OSStatus {st}");
-            let mut info = 0u32;
-            let st = VTDecompressionSessionDecodeFrame(self.session, sample, 0, null_mut(), &raw mut info);
-            CFRelease(sample);
-            if st != 0 {
-                return Err(anyhow!("video decode: OSStatus {st}"));
-            }
-        }
-        let mut out = Vec::new();
-        for msg in self.outbox.drain() {
-            match msg {
-                Ok(d) => out.push(d),
-                Err(e) => return Err(anyhow!("video decode: OSStatus {e}")),
-            }
-        }
-        Ok(out)
+        let sample = vt::sample(data, &self.format, time(pts, self.timescale), time(dts, self.timescale))?;
+        self.session.decode(&sample).map_err(|e| anyhow!("video decode: {e:#}"))?;
+        self.session.drain().into_iter().map(|p| p.map(|(pts, picture)| Decoded { pts, picture }).map_err(|e| anyhow!("video decode: OSStatus {e}"))).collect()
     }
 
     pub fn flush(&mut self) -> Vec<Decoded> {
-        // SAFETY: a live session.
-        unsafe { VTDecompressionSessionWaitForAsynchronousFrames(self.session) };
-        self.outbox.drain().into_iter().filter_map(Result::ok).collect()
-    }
-}
-
-impl Drop for Decoder {
-    fn drop(&mut self) {
-        // SAFETY: created in `new`, released once.
-        unsafe {
-            VTDecompressionSessionInvalidate(self.session);
-            CFRelease(self.session);
-            CFRelease(self.format);
-        }
+        self.session.wait();
+        self.session.drain().into_iter().filter_map(Result::ok).map(|(pts, picture)| Decoded { pts, picture }).collect()
     }
 }
 
@@ -191,62 +81,6 @@ pub struct Encoded {
     pub dts: i64,
     pub data: Vec<u8>,
     pub keyframe: bool,
-}
-
-/// What the encoder's callback sends: an encoded picture (with the `hvcC` box body on keyframes, for the
-/// owner to keep the first), or why encoding failed.
-enum EncodeMsg {
-    Frame(Encoded, Option<Vec<u8>>),
-    Error(OSStatus),
-}
-
-extern "C" fn on_encoded(refcon: *mut c_void, _f: *mut c_void, status: OSStatus, _flags: u32, sample: CMSampleBufferRef) {
-    // SAFETY: refcon is the encoder's outbox context, alive for the session's life. This runs on VideoToolbox's
-    // thread; the outbox's channel is what makes that safe.
-    let tx = unsafe { sender::<EncodeMsg>(refcon) };
-    if status != 0 {
-        let _ = tx.send(EncodeMsg::Error(status));
-        return;
-    }
-    if sample.is_null() {
-        return; // dropped frame
-    }
-    // SAFETY: a valid sample buffer for this call; everything read from it is copied out.
-    let msg = unsafe {
-        let block = CMSampleBufferGetDataBuffer(sample);
-        let len = CMBlockBufferGetDataLength(block);
-        let mut data = vec![0u8; len];
-        if CMBlockBufferCopyDataBytes(block, 0, len, data.as_mut_ptr().cast()) != 0 {
-            let _ = tx.send(EncodeMsg::Error(-3));
-            return;
-        }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sample);
-        let dts = CMSampleBufferGetDecodeTimeStamp(sample);
-        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, 0);
-        let not_sync = !attachments.is_null() && CFArrayGetCount(attachments) > 0 && {
-            let dict = CFArrayGetValueAtIndex(attachments, 0);
-            let v = CFDictionaryGetValue(dict, kCMSampleAttachmentKey_NotSync);
-            !v.is_null() && v == kCFBooleanTrue
-        };
-        // The codec configuration rides along with every keyframe (cheap: a keyframe every 2 s).
-        let mut hvcc = None;
-        if !not_sync {
-            let format = CMSampleBufferGetFormatDescription(sample);
-            let atoms = CMFormatDescriptionGetExtension(format, kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
-            if !atoms.is_null() {
-                let key = CFStringCreateWithCString(null(), c"hvcC".as_ptr(), 0x0800_0100);
-                let box_ = CFDictionaryGetValue(atoms, key);
-                CFRelease(key);
-                if !box_.is_null() {
-                    hvcc = Some(std::slice::from_raw_parts(CFDataGetBytePtr(box_), CFDataGetLength(box_) as usize).to_vec());
-                }
-            }
-        }
-        let pts = pts.value;
-        let dts = if dts.flags & 1 != 0 { dts.value } else { pts };
-        EncodeMsg::Frame(Encoded { pts, dts, data, keyframe: !not_sync }, hvcc)
-    };
-    let _ = tx.send(msg);
 }
 
 /// How hard the encoder squeezes: an average bitrate, or a constant quality (0.0-1.0) that spends bits where the
@@ -260,146 +94,60 @@ pub enum Rate {
 /// HEVC in hardware: no B-frames (decode order is presentation order), a keyframe whenever asked and at least
 /// every `max_key_secs`.
 pub struct Encoder {
-    session: VTCompressionSessionRef,
-    outbox: Outbox<EncodeMsg>,
+    session: Compression,
     /// The `hvcC` box body, from the first keyframe.
     hvcc: Option<Vec<u8>>,
     timescale: u32,
-    force_key: CFDictionaryRef,
 }
-
-unsafe impl Send for Encoder {}
 
 impl Encoder {
     pub fn new(width: u32, height: u32, rate: Rate, fps: f64, max_key_secs: f64, realtime: bool, timescale: u32) -> anyhow::Result<Self> {
-        let outbox = Outbox::new();
-        let mut session: VTCompressionSessionRef = null();
-        // SAFETY: the dictionaries and numbers are created, used and released here; session is an out-parameter
-        // and the sink outlives it (it is dropped after the session is invalidated).
-        unsafe {
-            let spec_keys = [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder];
-            let spec_values = [kCFBooleanTrue];
-            let spec = CFDictionaryCreate(
-                null(),
-                spec_keys.as_ptr(),
-                spec_values.as_ptr(),
-                1,
-                &raw const kCFTypeDictionaryKeyCallBacks,
-                &raw const kCFTypeDictionaryValueCallBacks,
-            );
-            let st = VTCompressionSessionCreate(
-                null(),
-                width as i32,
-                height as i32,
-                CODEC_HEVC,
-                spec,
-                null(),
-                null(),
-                on_encoded,
-                outbox.context(),
-                &raw mut session,
-            );
-            CFRelease(spec);
-            ensure!(st == 0, "HEVC encoder: OSStatus {st}");
-            let number_i64 = |v: i64| CFNumberCreate(null(), CF_NUMBER_SINT64, (&raw const v).cast());
-            let number_f64 = |v: f64| CFNumberCreate(null(), CF_NUMBER_FLOAT64, (&raw const v).cast());
-            let (rate_key, rate_value) = match rate {
-                Rate::Bitrate(bps) => (kVTCompressionPropertyKey_AverageBitRate, number_i64(bps)),
-                Rate::Quality(q) => (kVTCompressionPropertyKey_Quality, number_f64(f64::from(q.clamp(0.0, 1.0)))),
-            };
-            let set = |k: CFStringRef, v: CFTypeRef, release: bool| {
-                let st = VTSessionSetProperty(session, k, v);
-                if release {
-                    CFRelease(v);
-                }
-                st
-            };
-            let results = [
-                set(kVTCompressionPropertyKey_RealTime, if realtime { kCFBooleanTrue } else { kCFBooleanFalse }, false),
-                set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel, false),
-                set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, false),
-                set(rate_key, rate_value, true),
-                set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, number_f64(max_key_secs), true),
-                set(kVTCompressionPropertyKey_ExpectedFrameRate, number_f64(fps), true),
-            ];
-            if let Some(st) = results.iter().find(|&&st| st != 0) {
-                VTCompressionSessionInvalidate(session);
-                CFRelease(session);
-                return Err(anyhow!("HEVC encoder settings: OSStatus {st}"));
-            }
-            VTCompressionSessionPrepareToEncodeFrames(session);
-            let keys = [kVTEncodeFrameOptionKey_ForceKeyFrame];
-            let values = [kCFBooleanTrue];
-            let force_key = CFDictionaryCreate(
-                null(),
-                keys.as_ptr(),
-                values.as_ptr(),
-                1,
-                &raw const kCFTypeDictionaryKeyCallBacks,
-                &raw const kCFTypeDictionaryValueCallBacks,
-            );
-            Ok(Self { session, outbox, hvcc: None, timescale, force_key })
+        let k = keys();
+        let spec = vt::dict(&[(k.hardware_encoder, yes())]);
+        let mut session = Compression::new(width, height, CODEC_HEVC, Some(spec.as_ref()))?;
+        session.set(k.real_time, if realtime { yes() } else { no() })?;
+        session.set(k.profile_level, k.hevc_main_auto)?;
+        session.set(k.allow_reordering, no())?;
+        match rate {
+            Rate::Bitrate(bps) => session.set(k.average_bit_rate, &CFNumber::new_i64(bps))?,
+            Rate::Quality(q) => session.set(k.quality, &CFNumber::new_f64(f64::from(q.clamp(0.0, 1.0))))?,
         }
+        session.set(k.max_key_interval, &CFNumber::new_f64(max_key_secs))?;
+        session.set(k.expected_frame_rate, &CFNumber::new_f64(fps))?;
+        session.prepare();
+        Ok(Self { session, hvcc: None, timescale })
     }
 
     /// Encode a picture shown at `pts` for `duration`; `key` forces a keyframe. Returns what came out.
     pub fn encode(&mut self, picture: &PixelBuffer, pts: i64, duration: i64, key: bool) -> anyhow::Result<Vec<Encoded>> {
-        let mut info = 0u32;
-        // SAFETY: a live session and pixel buffer; the frame-properties dictionary lives as long as the encoder.
-        let st = unsafe {
-            VTCompressionSessionEncodeFrame(
-                self.session,
-                picture.raw(),
-                CMTime::new(pts, self.timescale),
-                CMTime::new(duration, self.timescale),
-                if key { self.force_key } else { null() },
-                null_mut(),
-                &raw mut info,
-            )
-        };
-        ensure!(st == 0, "HEVC encode: OSStatus {st}");
+        // Made when needed (a keyframe every 2 s): CoreFoundation dictionaries can't be kept in a Send type.
+        let force_key = key.then(|| vt::dict(&[(keys().force_key_frame, yes())]));
+        self.session.encode(picture.cv(), time(pts, self.timescale), time(duration, self.timescale), force_key.as_deref().map(AsRef::as_ref))?;
         self.take()
     }
 
-    /// What the callback has sent: the encoded pictures, or the first error.
+    /// What has come out: the encoded pictures, or the first error.
     fn take(&mut self) -> anyhow::Result<Vec<Encoded>> {
         let mut out = Vec::new();
-        for msg in self.outbox.drain() {
-            match msg {
-                EncodeMsg::Frame(e, hvcc) => {
-                    if self.hvcc.is_none() {
-                        self.hvcc = hvcc;
-                    }
-                    out.push(e);
-                }
-                EncodeMsg::Error(e) => return Err(anyhow!("HEVC encode: OSStatus {e}")),
+        for frame in self.session.drain() {
+            let s = frame.map_err(|e| anyhow!("HEVC encode: OSStatus {e}"))?;
+            if self.hvcc.is_none() {
+                self.hvcc = s.hvcc;
             }
+            out.push(Encoded { pts: s.pts, dts: s.dts, data: s.data, keyframe: s.keyframe });
         }
         Ok(out)
     }
 
     /// Everything still in the encoder.
     pub fn finish(&mut self) -> anyhow::Result<Vec<Encoded>> {
-        // SAFETY: a live session; an invalid time means "all frames".
-        let st = unsafe { VTCompressionSessionCompleteFrames(self.session, CMTime::INVALID) };
-        ensure!(st == 0, "HEVC encode: OSStatus {st}");
+        self.session.complete()?;
         self.take()
     }
 
     /// The `hvcC` box body, once the first picture is out.
     pub fn hvcc(&self) -> Option<&[u8]> {
         self.hvcc.as_deref()
-    }
-}
-
-impl Drop for Encoder {
-    fn drop(&mut self) {
-        // SAFETY: created in `new`, released once; invalidating first stops callbacks.
-        unsafe {
-            VTCompressionSessionInvalidate(self.session);
-            CFRelease(self.session);
-            CFRelease(self.force_key);
-        }
     }
 }
 
@@ -423,7 +171,7 @@ mod tests {
             if let Unit::Video { pts, dts, data, .. } = u {
                 if dec.is_none() {
                     let Some((w, h)) = mpegts::mpeg2::size(data) else { continue };
-                    dec = Some(Decoder::new(CODEC_MPEG2, w, h, 90_000).unwrap());
+                    dec = Some(Decoder::new(vt::CODEC_MPEG2, w, h, 90_000).unwrap());
                     let _ = &dec;
                 }
                 pictures.extend(dec.as_mut().unwrap().decode(data, *dts, *pts).unwrap());

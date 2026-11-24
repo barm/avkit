@@ -1,10 +1,12 @@
 //! Broadcast sound to AAC with AudioToolbox: AC-3 frames split out of their PES, decoded to 5.1 PCM (a stereo
 //! stretch upmixed into its front pair), and encoded as 5.1 AAC-LC.
 
-use crate::sys::*;
-use anyhow::{anyhow, ensure};
-use std::ffi::c_void;
-use std::ptr::{null, null_mut};
+use crate::at::{Converter, LayoutTag, compressed, pcm_f32};
+use objc2_audio_toolbox::{
+    kAudioConverterCompressionMagicCookie, kAudioConverterEncodeBitRate, kAudioConverterInputChannelLayout, kAudioConverterOutputChannelLayout,
+    kAudioConverterPropertyMaximumOutputPacketSize,
+};
+use objc2_core_audio_types::{kAudioChannelLayoutTag_MPEG_5_1_A, kAudioFormatAC3, kAudioFormatEnhancedAC3, kAudioFormatMPEG4AAC};
 
 /// Output channels: always 5.1 (L R C LFE Ls Rs), so the AAC track never changes shape mid-recording.
 pub const CHANNELS: usize = 6;
@@ -88,99 +90,28 @@ pub fn eac3_frames(data: &[u8]) -> Vec<(usize, usize, u32, usize)> {
     out
 }
 
-/// One packet for a converter's input callback (decoding: one compressed frame at a time).
-struct Packet<'a> {
-    data: Option<&'a [u8]>,
-    desc: AudioStreamPacketDescription,
-}
-
-const NO_MORE_INPUT: OSStatus = 0x6e6d_7264;
-
-extern "C" fn feed_packet(
-    _c: AudioConverterRef,
-    n: *mut u32,
-    list: *mut AudioBufferList,
-    desc: *mut *mut AudioStreamPacketDescription,
-    user: *mut c_void,
-) -> OSStatus {
-    // SAFETY: user is the Packet passed to FillComplexBuffer, alive for that call.
-    unsafe {
-        let p = &mut *(user as *mut Packet);
-        let Some(bytes) = p.data.take() else {
-            *n = 0;
-            return NO_MORE_INPUT;
-        };
-        *n = 1;
-        (*list).mNumberBuffers = 1;
-        (*list).mBuffers[0].mData = bytes.as_ptr() as *mut c_void;
-        (*list).mBuffers[0].mDataByteSize = bytes.len() as u32;
-        p.desc = AudioStreamPacketDescription { mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: bytes.len() as u32 };
-        if !desc.is_null() {
-            *desc = &raw mut p.desc;
-        }
-        0
-    }
-}
-
-fn layout(tag: u32) -> AudioChannelLayout {
-    AudioChannelLayout { mChannelLayoutTag: tag, mChannelBitmap: 0, mNumberChannelDescriptions: 0, mChannelDescriptions: [0; 20] }
-}
-
-fn pcm(channels: u32) -> AudioStreamBasicDescription {
-    AudioStreamBasicDescription {
-        mSampleRate: f64::from(RATE),
-        mFormatID: u32::from_be_bytes(*b"lpcm"),
-        mFormatFlags: 1 | 8,
-        mBytesPerPacket: 4 * channels,
-        mFramesPerPacket: 1,
-        mBytesPerFrame: 4 * channels,
-        mChannelsPerFrame: channels,
-        mBitsPerChannel: 32,
-        mReserved: 0,
-    }
-}
-
 /// Decodes AC-3 to interleaved 5.1 float PCM. AudioToolbox maps whatever the frame carries (2.0, 3/2, 5.1) into
 /// the 5.1 layout; a change of channels mid-stream gets a fresh decoder.
 pub struct Ac3Decoder {
-    converter: AudioConverterRef,
+    converter: Converter,
     channels: u32,
     out: Vec<f32>,
 }
 
-unsafe impl Send for Ac3Decoder {}
-
 impl Ac3Decoder {
     pub fn new(channels: u32) -> anyhow::Result<Self> {
-        Self::with_format(FORMAT_AC3, channels, AC3_FRAME_SAMPLES as u32)
+        Self::with_format(kAudioFormatAC3, channels, AC3_FRAME_SAMPLES as u32)
     }
 
     /// An E-AC-3 decoder for frames of `samples` samples.
     pub fn eac3(channels: u32, samples: u32) -> anyhow::Result<Self> {
-        Self::with_format(FORMAT_EAC3, channels, samples)
+        Self::with_format(kAudioFormatEnhancedAC3, channels, samples)
     }
 
     fn with_format(format: u32, channels: u32, samples: u32) -> anyhow::Result<Self> {
-        let input = AudioStreamBasicDescription {
-            mSampleRate: f64::from(RATE),
-            mFormatID: format,
-            mFramesPerPacket: samples,
-            mChannelsPerFrame: channels,
-            ..Default::default()
-        };
-        let output = pcm(CHANNELS as u32);
-        let mut converter: AudioConverterRef = null();
-        // SAFETY: valid descriptions; out-parameter; the layout struct is copied by the converter.
-        unsafe {
-            let st = AudioConverterNew(&raw const input, &raw const output, &raw mut converter);
-            ensure!(st == 0, "AC-3/E-AC-3 decoder ({channels} channels): OSStatus {st}");
-            let l = layout(LAYOUT_MPEG_5_1_A);
-            let st = AudioConverterSetProperty(converter, PROP_OUTPUT_LAYOUT, 12, (&raw const l).cast());
-            if st != 0 {
-                AudioConverterDispose(converter);
-                return Err(anyhow!("AC-3 decoder layout: OSStatus {st}"));
-            }
-        }
+        let mut converter = Converter::new(&compressed(RATE, format, samples, channels), &pcm_f32(RATE, CHANNELS as u32))
+            .map_err(|e| e.context(format!("AC-3/E-AC-3 decoder ({channels} channels)")))?;
+        converter.set(kAudioConverterOutputChannelLayout, &LayoutTag::new(kAudioChannelLayoutTag_MPEG_5_1_A))?;
         Ok(Self { converter, channels, out: vec![0.0; AC3_FRAME_SAMPLES * 2 * CHANNELS] })
     }
 
@@ -190,132 +121,42 @@ impl Ac3Decoder {
 
     /// Decode one AC-3 frame into interleaved 5.1 samples.
     pub fn decode(&mut self, frame: &[u8]) -> anyhow::Result<&[f32]> {
-        let mut packet = Packet { data: Some(frame), desc: AudioStreamPacketDescription::default() };
-        let capacity = (self.out.len() / CHANNELS) as u32;
-        let mut frames = capacity;
-        let mut list = AudioBufferList {
-            mNumberBuffers: 1,
-            mBuffers: [AudioBuffer { mNumberChannels: CHANNELS as u32, mDataByteSize: (self.out.len() * 4) as u32, mData: self.out.as_mut_ptr().cast() }],
-        };
-        // SAFETY: the callback's data lives for the call; the output list points at our buffer of `frames` frames.
-        let st = unsafe { AudioConverterFillComplexBuffer(self.converter, feed_packet, (&raw mut packet).cast(), &raw mut frames, &raw mut list, null_mut()) };
-        ensure!(st == 0 || st == NO_MORE_INPUT, "AC-3 decode: OSStatus {st}");
-        Ok(&self.out[..frames.min(capacity) as usize * CHANNELS])
-    }
-}
-
-impl Drop for Ac3Decoder {
-    fn drop(&mut self) {
-        // SAFETY: created in `new`.
-        unsafe { AudioConverterDispose(self.converter) };
-    }
-}
-
-/// The PCM waiting for the AAC encoder, and the encoder's input callback over it.
-struct Fifo {
-    samples: Vec<f32>,
-    /// Interleaved samples handed out in the last callback (removed after the call).
-    taken: usize,
-    /// No more input is coming: hand over what is left even if short (the encoder pads the last packet).
-    draining: bool,
-}
-
-extern "C" fn feed_pcm(
-    _c: AudioConverterRef,
-    n: *mut u32,
-    list: *mut AudioBufferList,
-    _desc: *mut *mut AudioStreamPacketDescription,
-    user: *mut c_void,
-) -> OSStatus {
-    // SAFETY: user is the encoder's Fifo, alive for the FillComplexBuffer call; the buffer handed out stays
-    // valid until that call returns (nothing else touches the FIFO meanwhile).
-    unsafe {
-        let f = &mut *(user as *mut Fifo);
-        let available = (f.samples.len() - f.taken) / CHANNELS;
-        let want = *n as usize;
-        if available == 0 && f.draining {
-            *n = 0;
-            return 0; // end of stream: the encoder flushes what it holds
-        }
-        if available == 0 || (available < want && !f.draining) {
-            *n = 0;
-            return NO_MORE_INPUT;
-        }
-        let give = available.min(want);
-        (*list).mNumberBuffers = 1;
-        (*list).mBuffers[0].mNumberChannels = CHANNELS as u32;
-        (*list).mBuffers[0].mData = f.samples.as_mut_ptr().add(f.taken).cast();
-        (*list).mBuffers[0].mDataByteSize = (give * CHANNELS * 4) as u32;
-        f.taken += give * CHANNELS;
-        *n = give as u32;
-        0
+        let frames = self.converter.decode_packet(frame, &mut self.out, CHANNELS)?;
+        Ok(&self.out[..frames * CHANNELS])
     }
 }
 
 /// 5.1 AAC-LC at a set bitrate, from interleaved 5.1 float PCM.
 pub struct AacEncoder {
-    converter: AudioConverterRef,
-    fifo: Box<Fifo>,
+    converter: Converter,
+    /// PCM waiting for the encoder (interleaved).
+    samples: Vec<f32>,
     max_packet: usize,
 }
 
-unsafe impl Send for AacEncoder {}
-
 impl AacEncoder {
     pub fn new(bitrate: u32) -> anyhow::Result<Self> {
-        let input = pcm(CHANNELS as u32);
-        let output = AudioStreamBasicDescription {
-            mSampleRate: f64::from(RATE),
-            mFormatID: u32::from_be_bytes(*b"aac "),
-            mFramesPerPacket: AAC_PACKET_SAMPLES as u32,
-            mChannelsPerFrame: CHANNELS as u32,
-            ..Default::default()
-        };
-        let mut converter: AudioConverterRef = null();
-        // SAFETY: as Ac3Decoder::new.
-        let max_packet = unsafe {
-            let st = AudioConverterNew(&raw const input, &raw const output, &raw mut converter);
-            ensure!(st == 0, "AAC encoder: OSStatus {st}");
-            let l = layout(LAYOUT_MPEG_5_1_A);
-            let rate = bitrate;
-            let st1 = AudioConverterSetProperty(converter, PROP_INPUT_LAYOUT, 12, (&raw const l).cast());
-            let st2 = AudioConverterSetProperty(converter, PROP_ENCODE_BITRATE, 4, (&raw const rate).cast());
-            let mut max = 0u32;
-            let mut size = 4u32;
-            let st3 = AudioConverterGetProperty(converter, PROP_MAX_OUTPUT_PACKET, &raw mut size, (&raw mut max).cast());
-            if let Some(st) = [st1, st2, st3].into_iter().find(|&s| s != 0) {
-                AudioConverterDispose(converter);
-                return Err(anyhow!("AAC encoder settings: OSStatus {st}"));
-            }
-            max as usize
-        };
-        Ok(Self { converter, fifo: Box::new(Fifo { samples: Vec::new(), taken: 0, draining: false }), max_packet })
+        let output = compressed(RATE, kAudioFormatMPEG4AAC, AAC_PACKET_SAMPLES as u32, CHANNELS as u32);
+        let mut converter = Converter::new(&pcm_f32(RATE, CHANNELS as u32), &output).map_err(|e| e.context("AAC encoder"))?;
+        converter.set(kAudioConverterInputChannelLayout, &LayoutTag::new(kAudioChannelLayoutTag_MPEG_5_1_A))?;
+        converter.set(kAudioConverterEncodeBitRate, &bitrate)?;
+        let max_packet = converter.get_u32(kAudioConverterPropertyMaximumOutputPacketSize)? as usize;
+        Ok(Self { converter, samples: Vec::new(), max_packet })
     }
 
     /// The ES descriptor (the `esds` body after version and flags), for the init segment.
     pub fn esds(&self) -> anyhow::Result<Vec<u8>> {
-        let mut size = 0u32;
-        // SAFETY: size query, then a buffer of that size.
-        unsafe {
-            let st = AudioConverterGetPropertyInfo(self.converter, PROP_COMPRESSION_COOKIE, &raw mut size, null_mut());
-            ensure!(st == 0, "AAC encoder cookie size: OSStatus {st}");
-            let mut cookie = vec![0u8; size as usize];
-            let st = AudioConverterGetProperty(self.converter, PROP_COMPRESSION_COOKIE, &raw mut size, cookie.as_mut_ptr().cast());
-            ensure!(st == 0, "AAC encoder cookie: OSStatus {st}");
-            cookie.truncate(size as usize);
-            Ok(cookie)
-        }
+        self.converter.get_bytes(kAudioConverterCompressionMagicCookie)
     }
 
     /// Add interleaved 5.1 samples; returns the AAC packets that are ready (each `AAC_PACKET_SAMPLES` long).
     pub fn push(&mut self, samples: &[f32]) -> anyhow::Result<Vec<Vec<u8>>> {
-        self.fifo.samples.extend_from_slice(samples);
+        self.samples.extend_from_slice(samples);
         self.drain(false)
     }
 
     /// The rest, the last packet padded with silence.
     pub fn finish(&mut self) -> anyhow::Result<Vec<Vec<u8>>> {
-        self.fifo.draining = true;
         self.drain(true)
     }
 
@@ -323,35 +164,15 @@ impl AacEncoder {
         let mut packets = Vec::new();
         let mut buf = vec![0u8; self.max_packet];
         loop {
-            if !all && self.fifo.samples.len() / CHANNELS < AAC_PACKET_SAMPLES {
+            if !all && self.samples.len() / CHANNELS < AAC_PACKET_SAMPLES {
                 break;
             }
-            let mut n = 1u32;
-            let mut desc = AudioStreamPacketDescription::default();
-            let mut list = AudioBufferList {
-                mNumberBuffers: 1,
-                mBuffers: [AudioBuffer { mNumberChannels: CHANNELS as u32, mDataByteSize: buf.len() as u32, mData: buf.as_mut_ptr().cast() }],
-            };
-            self.fifo.taken = 0;
-            // SAFETY: the FIFO is boxed and outlives the call; the output list points at `buf`.
-            let st =
-                unsafe { AudioConverterFillComplexBuffer(self.converter, feed_pcm, (&raw mut *self.fifo).cast(), &raw mut n, &raw mut list, &raw mut desc) };
-            let taken = self.fifo.taken;
-            self.fifo.samples.drain(..taken);
-            ensure!(st == 0 || st == NO_MORE_INPUT, "AAC encode: OSStatus {st}");
-            if n == 0 {
-                break;
-            }
-            packets.push(buf[..list.mBuffers[0].mDataByteSize as usize].to_vec());
+            let (taken, packet) = self.converter.encode_packet(&self.samples, CHANNELS, all, &mut buf)?;
+            self.samples.drain(..taken);
+            let Some(len) = packet else { break };
+            packets.push(buf[..len].to_vec());
         }
         Ok(packets)
-    }
-}
-
-impl Drop for AacEncoder {
-    fn drop(&mut self) {
-        // SAFETY: created in `new`.
-        unsafe { AudioConverterDispose(self.converter) };
     }
 }
 

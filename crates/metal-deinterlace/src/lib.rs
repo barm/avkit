@@ -6,17 +6,20 @@
 //! (CoreVideo's texture cache); output goes to buffers from a pool, ready for the encoder.
 
 use anyhow::{Context, anyhow, ensure};
-use apple_media::sys::*;
 use apple_media::video::PixelBuffer;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType};
+use objc2_core_video::{
+    CVMetalTexture, CVMetalTextureCache, CVMetalTextureGetTexture, CVPixelBuffer, CVPixelBufferPool, kCVPixelBufferHeightKey,
+    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
+};
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLLibrary, MTLSize, MTLTexture,
+    MTLLibrary, MTLPixelFormat, MTLSize,
 };
-use std::ffi::c_void;
-use std::ptr::{NonNull, null};
+use std::ptr::{NonNull, null_mut};
 
 const SHADER: &str = r#"
 #include <metal_stdlib>
@@ -90,22 +93,25 @@ pub struct Deinterlacer {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    cache: CVMetalTextureCacheRef,
-    pool: CVPixelBufferPoolRef,
+    cache: CFRetained<CVMetalTextureCache>,
+    pool: CFRetained<CVPixelBufferPool>,
     width: usize,
     height: usize,
 }
 
+// SAFETY: Metal devices, queues and pipeline states, and CoreVideo caches and pools, may be used from any thread;
+// a Deinterlacer is used by one thread at a time (`&mut self`).
 unsafe impl Send for Deinterlacer {}
 
-/// A plane of a pixel buffer as a Metal texture (kept alive until the GPU is done with it).
-struct PlaneTexture(CVMetalTextureRef);
-
-impl Drop for PlaneTexture {
-    fn drop(&mut self) {
-        // SAFETY: created by the texture cache, released once.
-        unsafe { CFRelease(self.0) };
-    }
+/// Take ownership of a +1 reference a successful create call returned through `out`.
+///
+/// # Safety
+/// `out` must be what the call just returned (an object it created for us), and `st` its status.
+unsafe fn adopt<T: objc2_core_foundation::Type>(st: i32, out: *mut T, what: &str) -> anyhow::Result<CFRetained<T>> {
+    ensure!(st == 0, "{what}: CVReturn {st}");
+    let out = NonNull::new(out).with_context(|| format!("{what}: nothing returned"))?;
+    // SAFETY: by the contract above, a +1 reference we now own.
+    Ok(unsafe { CFRetained::from_raw(out) })
 }
 
 impl Deinterlacer {
@@ -115,41 +121,49 @@ impl Deinterlacer {
         let library = device.newLibraryWithSource_options_error(&NSString::from_str(SHADER), None).map_err(|e| anyhow!("deinterlacer shader: {e}"))?;
         let function = library.newFunctionWithName(&NSString::from_str("yadif")).context("no yadif kernel")?;
         let pipeline = device.newComputePipelineStateWithFunction_error(&function).map_err(|e| anyhow!("deinterlacer pipeline: {e}"))?;
-        let mut cache: CVMetalTextureCacheRef = null();
-        // SAFETY: the device outlives the cache (both owned here); out-parameters; dictionaries released after use.
+
+        let mut cache: *mut CVMetalTextureCache = null_mut();
+        // SAFETY: a live device; out-parameter, adopted right after.
+        let cache = unsafe {
+            let st = CVMetalTextureCache::create(None, None, &device, None, NonNull::from(&mut cache));
+            adopt(st, cache, "Metal texture cache")?
+        };
+        // Output buffers: 420v at this size, backed by IOSurfaces Metal can write.
+        // SAFETY: CoreVideo's exported constant strings, initialised before main and never changed.
+        let (k_format, k_width, k_height, k_surface, k_metal) = unsafe {
+            (
+                kCVPixelBufferPixelFormatTypeKey,
+                kCVPixelBufferWidthKey,
+                kCVPixelBufferHeightKey,
+                kCVPixelBufferIOSurfacePropertiesKey,
+                kCVPixelBufferMetalCompatibilityKey,
+            )
+        };
+        let (format, w, h) = (CFNumber::new_i32(0x3432_3076), CFNumber::new_i32(width as i32), CFNumber::new_i32(height as i32));
+        let surface = CFDictionary::<CFString, CFType>::empty();
+        let attributes = CFDictionary::<CFString, CFType>::from_slices(
+            &[k_format, k_width, k_height, k_surface, k_metal],
+            &[&format, &w, &h, &surface, CFBoolean::new(true)],
+        );
+        let mut pool: *mut CVPixelBufferPool = null_mut();
+        // SAFETY: a live attributes dictionary; out-parameter, adopted right after.
         let pool = unsafe {
-            let st = CVMetalTextureCacheCreate(null(), null(), Retained::as_ptr(&device) as *mut c_void, null(), &raw mut cache);
-            ensure!(st == 0, "Metal texture cache: {st}");
-            let attrs = CFDictionaryCreateMutable(null(), 0, &raw const kCFTypeDictionaryKeyCallBacks, &raw const kCFTypeDictionaryValueCallBacks);
-            let num = |v: i32| CFNumberCreate(null(), 3, (&raw const v).cast());
-            let (fmt, w, h) = (num(0x3432_3076), num(width as i32), num(height as i32));
-            let surface = CFDictionaryCreateMutable(null(), 0, &raw const kCFTypeDictionaryKeyCallBacks, &raw const kCFTypeDictionaryValueCallBacks);
-            CFDictionarySetValue(attrs, kCVPixelBufferPixelFormatTypeKey, fmt);
-            CFDictionarySetValue(attrs, kCVPixelBufferWidthKey, w);
-            CFDictionarySetValue(attrs, kCVPixelBufferHeightKey, h);
-            CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, surface);
-            CFDictionarySetValue(attrs, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);
-            let mut pool: CVPixelBufferPoolRef = null();
-            let st = CVPixelBufferPoolCreate(null(), null(), attrs, &raw mut pool);
-            for v in [attrs, surface, fmt, w, h] {
-                CFRelease(v);
-            }
-            if st != 0 {
-                CFRelease(cache);
-                return Err(anyhow!("pixel buffer pool: {st}"));
-            }
-            pool
+            let st = CVPixelBufferPool::create(None, None, Some(attributes.as_ref()), NonNull::from(&mut pool));
+            adopt(st, pool, "pixel buffer pool")?
         };
         Ok(Self { device, queue, pipeline, cache, pool, width, height })
     }
 
-    fn texture(&self, pb: &PixelBuffer, plane: usize) -> anyhow::Result<PlaneTexture> {
-        let (format, w, h) = if plane == 0 { (MTL_R8_UNORM, self.width, self.height) } else { (MTL_RG8_UNORM, self.width / 2, self.height / 2) };
-        let mut tex: CVMetalTextureRef = null();
-        // SAFETY: a live pixel buffer and cache; out-parameter.
-        let st = unsafe { CVMetalTextureCacheCreateTextureFromImage(null(), self.cache, pb.raw(), null(), format, w, h, plane, &raw mut tex) };
-        ensure!(st == 0 && !tex.is_null(), "Metal texture for plane {plane}: {st}");
-        Ok(PlaneTexture(tex))
+    /// A plane of a pixel buffer as a Metal texture (keep it alive until the GPU is done with it).
+    fn texture(&self, pb: &PixelBuffer, plane: usize) -> anyhow::Result<CFRetained<CVMetalTexture>> {
+        let (format, w, h) =
+            if plane == 0 { (MTLPixelFormat::R8Unorm, self.width, self.height) } else { (MTLPixelFormat::RG8Unorm, self.width / 2, self.height / 2) };
+        let mut tex: *mut CVMetalTexture = null_mut();
+        // SAFETY: a live cache and pixel buffer; out-parameter, adopted right after.
+        unsafe {
+            let st = CVMetalTextureCache::create_texture_from_image(None, &self.cache, pb.cv(), None, format, w, h, plane, NonNull::from(&mut tex));
+            adopt(st, tex, &format!("Metal texture for plane {plane}"))
+        }
     }
 
     /// The picture for one field of `cur`: the lines of parity `keep` (0 top, 1 bottom) from `cur`, the others
@@ -162,11 +176,12 @@ impl Deinterlacer {
     }
 
     fn field_in_pool(&mut self, prev: &PixelBuffer, cur: &PixelBuffer, next: &PixelBuffer, keep: u32, early: bool) -> anyhow::Result<PixelBuffer> {
-        let mut out_raw: CVImageBufferRef = null();
-        // SAFETY: a live pool; out-parameter (a +1 reference, owned by the PixelBuffer below).
-        let st = unsafe { CVPixelBufferPoolCreatePixelBuffer(null(), self.pool, &raw mut out_raw) };
-        ensure!(st == 0 && !out_raw.is_null(), "pixel buffer from pool: {st}");
-        let out = PixelBuffer::adopt(out_raw);
+        let mut out: *mut CVPixelBuffer = null_mut();
+        // SAFETY: a live pool; out-parameter, adopted right after.
+        let out = PixelBuffer::new(unsafe {
+            let st = CVPixelBufferPool::create_pixel_buffer(None, &self.pool, NonNull::from(&mut out));
+            adopt(st, out, "pixel buffer from pool")?
+        });
         let params = Params { keep, early: u32::from(early) };
         let cb = self.queue.commandBuffer().context("no command buffer")?;
         let enc = cb.computeCommandEncoder().context("no compute encoder")?;
@@ -174,14 +189,13 @@ impl Deinterlacer {
         let mut keep_alive = Vec::new();
         for plane in 0..2 {
             let textures = [self.texture(prev, plane)?, self.texture(cur, plane)?, self.texture(next, plane)?, self.texture(&out, plane)?];
-            // SAFETY: each CVMetalTexture yields a valid id<MTLTexture> while it is alive (kept until the GPU is done).
-            unsafe {
-                for (i, t) in textures.iter().enumerate() {
-                    let raw = CVMetalTextureGetTexture(t.0) as *const ProtocolObject<dyn MTLTexture>;
-                    enc.setTexture_atIndex(Some(&*raw), i);
-                }
-                enc.setBytes_length_atIndex(NonNull::from(&params).cast(), size_of::<Params>(), 0);
+            for (i, t) in textures.iter().enumerate() {
+                let texture = CVMetalTextureGetTexture(t).context("a texture without a Metal texture")?;
+                // SAFETY: a live texture, bound for this dispatch only.
+                unsafe { enc.setTexture_atIndex(Some(&texture), i) };
             }
+            // SAFETY: `params` lives until the encoder has copied it (setBytes copies immediately).
+            unsafe { enc.setBytes_length_atIndex(NonNull::from(&params).cast(), size_of::<Params>(), 0) };
             let (w, h) = if plane == 0 { (self.width, self.height) } else { (self.width / 2, self.height / 2) };
             enc.dispatchThreads_threadsPerThreadgroup(MTLSize { width: w, height: h, depth: 1 }, MTLSize { width: 16, height: 16, depth: 1 });
             keep_alive.extend(textures);
@@ -190,20 +204,9 @@ impl Deinterlacer {
         cb.commit();
         cb.waitUntilCompleted();
         drop(keep_alive);
-        // SAFETY: a live cache.
-        unsafe { CVMetalTextureCacheFlush(self.cache, 0) };
+        self.cache.flush(0);
         let _ = &self.device;
         Ok(out)
-    }
-}
-
-impl Drop for Deinterlacer {
-    fn drop(&mut self) {
-        // SAFETY: created in `new`, released once.
-        unsafe {
-            CFRelease(self.cache);
-            CFRelease(self.pool);
-        }
     }
 }
 
@@ -240,7 +243,7 @@ mod tests {
             if let mpegts::Unit::Video { pts, dts, data, .. } = u {
                 if dec.is_none() {
                     let Some((w, h)) = mpegts::mpeg2::size(data) else { continue };
-                    dec = Some(Decoder::new(apple_media::sys::CODEC_MPEG2, w, h, 90_000).unwrap());
+                    dec = Some(Decoder::new(apple_media::video::CODEC_MPEG2, w, h, 90_000).unwrap());
                 }
                 pics.extend(dec.as_mut().unwrap().decode(data, *dts, *pts).unwrap().into_iter().map(|p| p.picture));
                 if pics.len() >= 8 {

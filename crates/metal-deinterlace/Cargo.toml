@@ -9,6 +9,8 @@ description = "yadif deinterlacing on the GPU (Metal) over CoreVideo pixel buffe
 anyhow = "1"
 apple-media = { path = "../apple-media" }
 objc2 = "0.6"
+objc2-core-foundation = "0.3"
+objc2-core-video = { version = "0.3", features = ["objc2-metal"] }
 objc2-foundation = "0.3"
 objc2-metal = "0.3"
 
