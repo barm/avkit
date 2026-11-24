@@ -7,11 +7,10 @@
 
 #![forbid(unsafe_code)]
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use apple_media::analysis::{AacDecoder, HevcDecoder, Picture};
 use fmp4::read::{self as mp4, Init, TrackKind};
 use std::collections::BTreeSet;
-use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -129,62 +128,12 @@ const BATCH: usize = 32 << 20;
 
 /// Decodes a whole fragmented MP4 file, read as a stream (never all in memory), on its own clock from zero.
 pub fn scan_file(path: &Path, width: usize, height: usize, fps: f64, sink: &mut impl Sink) -> anyhow::Result<()> {
-    let mut r = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?);
-    // Everything up to and including `moov` is the init segment.
-    let mut init = Vec::new();
-    loop {
-        let Some(b) = next_box(&mut r)? else { bail!("{}: no moov box", path.display()) };
-        init.extend_from_slice(&b.1);
-        if &b.0 == b"moov" {
-            break;
-        }
-    }
+    let (init, fragments) = fmp4::stream::open(path, BATCH)?;
     let mut scan = Scan::new(&init, width, height, fps)?;
-    let mut batch = Vec::new();
-    while let Some((kind, bytes)) = next_box(&mut r)? {
-        // A batch ends after an `mdat`, so every `moof` is with its data.
-        let end = &kind == b"mdat";
-        batch.extend_from_slice(&bytes);
-        if end && batch.len() >= BATCH {
-            scan.feed_stream(&batch, sink)?;
-            batch.clear();
-        }
-    }
-    if !batch.is_empty() {
-        scan.feed_stream(&batch, sink)?;
+    for batch in fragments {
+        scan.feed_stream(&batch?, sink)?;
     }
     Ok(())
-}
-
-/// The next top-level box, header included, or `None` at the end of the file.
-fn next_box(r: &mut impl Read) -> anyhow::Result<Option<([u8; 4], Vec<u8>)>> {
-    let mut head = [0u8; 8];
-    match r.read_exact(&mut head) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    let kind: [u8; 4] = head[4..8].try_into().unwrap();
-    let mut buf = head.to_vec();
-    let size = match u32::from_be_bytes(head[..4].try_into().unwrap()) {
-        1 => {
-            let mut large = [0u8; 8];
-            r.read_exact(&mut large)?;
-            buf.extend_from_slice(&large);
-            u64::from_be_bytes(large)
-        }
-        0 => bail!("a box running to the end of the file isn't supported"),
-        n => u64::from(n),
-    };
-    let rest = size.checked_sub(buf.len() as u64).context("box shorter than its header")?;
-    let start = buf.len();
-    buf.resize(start + usize::try_from(rest)?, 0);
-    match r.read_exact(&mut buf[start..]) {
-        Ok(()) => Ok(Some((kind, buf))),
-        // A recording still being written can end mid-box: stop at the last whole one.
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-        Err(e) => Err(e.into()),
-    }
 }
 
 #[cfg(test)]

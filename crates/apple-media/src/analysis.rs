@@ -3,11 +3,11 @@
 
 use anyhow::{anyhow, ensure};
 
-use crate::at::{Converter, compressed, pcm_f32};
+use crate::at::{Converter, LayoutTag, compressed, pcm_f32};
 use crate::video::PixelBuffer;
 use crate::vt::{self, Decompression, PIXEL_FORMAT_420F, PIXEL_FORMAT_420V, keys, time};
-use objc2_audio_toolbox::kAudioConverterDecompressionMagicCookie;
-use objc2_core_audio_types::kAudioFormatMPEG4AAC;
+use objc2_audio_toolbox::{kAudioConverterDecompressionMagicCookie, kAudioConverterOutputChannelLayout};
+use objc2_core_audio_types::{kAudioChannelLayoutTag_MPEG_5_1_A, kAudioFormatMPEG4AAC};
 use objc2_core_foundation::{CFNumber, CFRetained};
 use objc2_core_media::CMFormatDescription;
 use objc2_core_video::CVPixelBufferGetPixelFormatType;
@@ -71,7 +71,9 @@ impl HevcDecoder {
         let format = vt::hevc_format(parameter_sets, nal_length_size)?;
         let pixel = CFNumber::new_i32(PIXEL_FORMAT_420V as i32);
         let attributes = vt::dict(&[(keys().pixel_format, &pixel)]);
-        let session = Decompression::new(&format, Some(attributes.as_ref()))?;
+        let mut session = Decompression::new(&format, Some(attributes.as_ref()))?;
+        // Analysis is batch work: let the decoder run ahead (the caller flushes after each run of fragments).
+        session.asynchronous();
         Ok(Self { session, format, timescale, width, height, want })
     }
 
@@ -119,13 +121,27 @@ impl AacDecoder {
         let input = compressed(sample_rate, kAudioFormatMPEG4AAC, AAC_FRAMES_PER_PACKET, u32::from(channels));
         let mut converter = Converter::new(&input, &pcm_f32(sample_rate, u32::from(channels))).map_err(|e| e.context("AAC decoder"))?;
         converter.set_bytes(kAudioConverterDecompressionMagicCookie, esds).map_err(|e| e.context("AAC decoder config"))?;
+        if channels == 6 {
+            // Name the order the channels come out in: L R C LFE Ls Rs, as `audio` writes them.
+            converter.set(kAudioConverterOutputChannelLayout, &LayoutTag::new(kAudioChannelLayoutTag_MPEG_5_1_A))?;
+        }
         Ok(Self { converter, channels: usize::from(channels), buffer: vec![0.0; AAC_FRAMES_PER_PACKET as usize * 2 * usize::from(channels)] })
     }
 
     /// Decode one packet; returns the mono samples that came out (the decoder may hold some back at first).
     pub fn decode(&mut self, packet: &[u8]) -> anyhow::Result<Vec<f32>> {
+        let channels = self.channels;
+        Ok(self.decode_channels(packet)?.chunks_exact(channels).map(|f| f.iter().fold(0f32, |m, s| m.max(s.abs()))).collect())
+    }
+
+    /// Decode one packet into every channel, interleaved (5.1 as L R C LFE Ls Rs).
+    pub fn decode_channels(&mut self, packet: &[u8]) -> anyhow::Result<&[f32]> {
         let frames = self.converter.decode_packet(packet, &mut self.buffer, self.channels)?;
-        Ok(self.buffer[..frames * self.channels].chunks_exact(self.channels).map(|f| f.iter().fold(0f32, |m, s| m.max(s.abs()))).collect())
+        Ok(&self.buffer[..frames * self.channels])
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channels
     }
 }
 

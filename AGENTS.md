@@ -4,7 +4,7 @@ Media crates shared by barm/dvr and barm/adbreak (git dependencies pinned by rev
 their pin moves). avkit depends on neither.
 
 - One job per crate; new self-contained functionality gets its own crate.
-- `unsafe`: the pure crates (`mpegts`, `cea608`, `fmp4`, `fmp4-scan`) `#![forbid(unsafe_code)]`. FFI to Apple's
+- `unsafe`: the pure crates and those built on the others (`mpegts`, `cea608`, `fmp4`, `fmp4-scan`, `fmp4-shrink`) `#![forbid(unsafe_code)]`. FFI to Apple's
   frameworks lives only in `apple-media` (`vt.rs`, `at.rs`) and `metal-deinterlace`.
 - Test fixtures live in each crate's `tests/fixtures`.
 - Before committing: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
