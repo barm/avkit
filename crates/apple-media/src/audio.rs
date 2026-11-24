@@ -6,7 +6,7 @@ use objc2_audio_toolbox::{
     kAudioConverterCompressionMagicCookie, kAudioConverterEncodeBitRate, kAudioConverterInputChannelLayout, kAudioConverterOutputChannelLayout,
     kAudioConverterPropertyMaximumOutputPacketSize,
 };
-use objc2_core_audio_types::{kAudioChannelLayoutTag_MPEG_5_1_A, kAudioFormatAC3, kAudioFormatEnhancedAC3, kAudioFormatMPEG4AAC};
+use objc2_core_audio_types::{kAudioChannelLayoutTag_MPEG_5_1_A, kAudioChannelLayoutTag_Mono, kAudioFormatAC3, kAudioFormatEnhancedAC3, kAudioFormatMPEG4AAC};
 
 /// Output channels: always 5.1 (L R C LFE Ls Rs), so the AAC track never changes shape mid-recording.
 pub const CHANNELS: usize = 6;
@@ -126,22 +126,33 @@ impl Ac3Decoder {
     }
 }
 
-/// 5.1 AAC-LC at a set bitrate, from interleaved 5.1 float PCM.
+/// AAC-LC at a set bitrate, 48 kHz, from interleaved float PCM: 5.1 (`new`) or mono (`mono`).
 pub struct AacEncoder {
     converter: Converter,
+    channels: usize,
     /// PCM waiting for the encoder (interleaved).
     samples: Vec<f32>,
     max_packet: usize,
 }
 
 impl AacEncoder {
+    /// 5.1 (L R C LFE Ls Rs).
     pub fn new(bitrate: u32) -> anyhow::Result<Self> {
-        let output = compressed(RATE, kAudioFormatMPEG4AAC, AAC_PACKET_SAMPLES as u32, CHANNELS as u32);
-        let mut converter = Converter::new(&pcm_f32(RATE, CHANNELS as u32), &output).map_err(|e| e.context("AAC encoder"))?;
-        converter.set(kAudioConverterInputChannelLayout, &LayoutTag::new(kAudioChannelLayoutTag_MPEG_5_1_A))?;
+        Self::with_layout(CHANNELS, kAudioChannelLayoutTag_MPEG_5_1_A, bitrate)
+    }
+
+    /// One channel.
+    pub fn mono(bitrate: u32) -> anyhow::Result<Self> {
+        Self::with_layout(1, kAudioChannelLayoutTag_Mono, bitrate)
+    }
+
+    fn with_layout(channels: usize, layout: u32, bitrate: u32) -> anyhow::Result<Self> {
+        let output = compressed(RATE, kAudioFormatMPEG4AAC, AAC_PACKET_SAMPLES as u32, channels as u32);
+        let mut converter = Converter::new(&pcm_f32(RATE, channels as u32), &output).map_err(|e| e.context("AAC encoder"))?;
+        converter.set(kAudioConverterInputChannelLayout, &LayoutTag::new(layout))?;
         converter.set(kAudioConverterEncodeBitRate, &bitrate)?;
         let max_packet = converter.get_u32(kAudioConverterPropertyMaximumOutputPacketSize)? as usize;
-        Ok(Self { converter, samples: Vec::new(), max_packet })
+        Ok(Self { converter, channels, samples: Vec::new(), max_packet })
     }
 
     /// The ES descriptor (the `esds` body after version and flags), for the init segment.
@@ -149,7 +160,7 @@ impl AacEncoder {
         self.converter.get_bytes(kAudioConverterCompressionMagicCookie)
     }
 
-    /// Add interleaved 5.1 samples; returns the AAC packets that are ready (each `AAC_PACKET_SAMPLES` long).
+    /// Add interleaved samples (as many channels as the encoder has); returns the AAC packets that are ready (each `AAC_PACKET_SAMPLES` long).
     pub fn push(&mut self, samples: &[f32]) -> anyhow::Result<Vec<Vec<u8>>> {
         self.samples.extend_from_slice(samples);
         self.drain(false)
@@ -164,10 +175,10 @@ impl AacEncoder {
         let mut packets = Vec::new();
         let mut buf = vec![0u8; self.max_packet];
         loop {
-            if !all && self.samples.len() / CHANNELS < AAC_PACKET_SAMPLES {
+            if !all && self.samples.len() / self.channels < AAC_PACKET_SAMPLES {
                 break;
             }
-            let (taken, packet) = self.converter.encode_packet(&self.samples, CHANNELS, all, &mut buf)?;
+            let (taken, packet) = self.converter.encode_packet(&self.samples, self.channels, all, &mut buf)?;
             self.samples.drain(..taken);
             let Some(len) = packet else { break };
             packets.push(buf[..len].to_vec());
@@ -219,5 +230,22 @@ mod tests {
         assert!((7..=9).contains(&packets.len()), "{}", packets.len());
         let esds = enc.esds().unwrap();
         assert_eq!(esds[0], 0x03, "an ES descriptor");
+    }
+}
+
+#[cfg(test)]
+mod mono_tests {
+    use super::*;
+
+    #[test]
+    fn encodes_mono() {
+        let mut e = AacEncoder::mono(48_000).unwrap();
+        let tone: Vec<f32> = (0..48_000).map(|i| 0.25 * (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin()).collect();
+        let mut packets = Vec::new();
+        for chunk in tone.chunks(1000) {
+            packets.extend(e.push(chunk).unwrap());
+        }
+        packets.extend(e.finish().unwrap());
+        assert!(packets.len() >= 46, "{} packets", packets.len());
     }
 }

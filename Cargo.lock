@@ -72,6 +72,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fmp4-shrink"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "apple-media",
+ "fmp4",
+ "fmp4-scan",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"

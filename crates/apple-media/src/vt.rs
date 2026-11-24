@@ -12,7 +12,7 @@ use objc2_core_media::{
     CMVideoFormatDescriptionCreateFromH264ParameterSets, CMVideoFormatDescriptionCreateFromHEVCParameterSets,
     kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms, kCMSampleAttachmentKey_NotSync,
 };
-use objc2_core_video::{CVImageBuffer, CVPixelBuffer, kCVPixelBufferPixelFormatTypeKey};
+use objc2_core_video::{CVImageBuffer, CVPixelBuffer, kCVPixelBufferHeightKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey};
 use objc2_video_toolbox::{
     VTCompressionOutputCallback, VTCompressionSession, VTDecodeFrameFlags, VTDecodeInfoFlags, VTDecompressionOutputCallback,
     VTDecompressionOutputCallbackRecord, VTDecompressionSession, VTEncodeInfoFlags, VTSessionSetProperty, kVTCompressionPropertyKey_AllowFrameReordering,
@@ -42,6 +42,8 @@ pub const INVALID_TIME: CMTime = CMTime { value: 0, timescale: 0, flags: CMTimeF
 /// The constant keys and values VideoToolbox and CoreVideo define, read once.
 pub struct Keys {
     pub pixel_format: &'static CFString,
+    pub width: &'static CFString,
+    pub height: &'static CFString,
     pub hardware_encoder: &'static CFString,
     pub real_time: &'static CFString,
     pub profile_level: &'static CFString,
@@ -59,6 +61,8 @@ pub fn keys() -> Keys {
     unsafe {
         Keys {
             pixel_format: kCVPixelBufferPixelFormatTypeKey,
+            width: kCVPixelBufferWidthKey,
+            height: kCVPixelBufferHeightKey,
             hardware_encoder: kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
             real_time: kVTCompressionPropertyKey_RealTime,
             profile_level: kVTCompressionPropertyKey_ProfileLevel,
@@ -277,6 +281,7 @@ pub struct Decompression {
     // Field order is drop order: the session (invalidated, so no more callbacks) before the outbox they send to.
     session: CFRetained<VTDecompressionSession>,
     outbox: Outbox<Picture>,
+    flags: VTDecodeFrameFlags,
 }
 
 // SAFETY: a VideoToolbox session may be used from any thread, one at a time; `&mut self` methods ensure that.
@@ -292,14 +297,20 @@ impl Decompression {
         // SAFETY: the format and attributes are live; the callback record is copied; its context is our outbox,
         // which this struct keeps until after the session is invalidated.
         let st = unsafe { VTDecompressionSession::create(None, format, None, attributes, &record, NonNull::from(&mut out)) };
-        Ok(Self { session: adopt(st, out, "video decoder")?, outbox })
+        Ok(Self { session: adopt(st, out, "video decoder")?, outbox, flags: VTDecodeFrameFlags(0) })
     }
 
-    /// Decode one sample, synchronously; then `drain` has its pictures.
+    /// Let `decode` return before the picture is decoded, so the decoder works through several at once (for
+    /// decoding faster than real time). Pictures then come out later: `wait` before the last `drain`.
+    pub fn asynchronous(&mut self) {
+        self.flags = VTDecodeFrameFlags::Frame_EnableAsynchronousDecompression;
+    }
+
+    /// Decode one sample: synchronously (then `drain` has its pictures), or, if `asynchronous`, queued.
     pub fn decode(&mut self, sample: &CMSampleBuffer) -> Result<()> {
         let mut info = VTDecodeInfoFlags(0);
         // SAFETY: a live session and sample; no per-frame context; out-parameter.
-        let st = unsafe { self.session.decode_frame(sample, VTDecodeFrameFlags(0), null_mut(), &mut info) };
+        let st = unsafe { self.session.decode_frame(sample, self.flags, null_mut(), &mut info) };
         ensure!(st == 0, "VideoToolbox decode: OSStatus {st}");
         Ok(())
     }

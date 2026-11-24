@@ -1,0 +1,15 @@
+[package]
+name = "fmp4-shrink"
+version = "0.1.0"
+edition = "2024"
+description = "A small copy of a fragmented MP4 recording (HEVC + AAC): scaled down and re-encoded in hardware, sound mixed to mono, as a single file with a byte-range playlist to seek by. macOS."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/barm/avkit"
+
+[dependencies]
+anyhow = "1"
+apple-media = { path = "../apple-media" }
+fmp4 = { path = "../fmp4" }
+
+[dev-dependencies]
+fmp4-scan = { path = "../fmp4-scan" }

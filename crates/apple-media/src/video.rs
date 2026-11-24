@@ -45,21 +45,40 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn new(codec: u32, width: u32, height: u32, timescale: u32) -> anyhow::Result<Self> {
-        Self::with_format(vt::video_format(codec, width, height)?, timescale)
+        Self::with_format(vt::video_format(codec, width, height)?, timescale, None)
+    }
+
+    /// An HEVC decoder for a track's parameter sets (VPS, SPS, PPS); samples are length-prefixed NAL units.
+    /// With `size`, VideoToolbox scales the pictures to that size as it decodes them (in hardware).
+    pub fn hevc(parameter_sets: &[Vec<u8>], nal_length_size: u8, timescale: u32, size: Option<(u32, u32)>) -> anyhow::Result<Self> {
+        Self::with_format(vt::hevc_format(parameter_sets, nal_length_size)?, timescale, size)
     }
 
     /// An H.264 decoder for these parameter sets (NAL units without start codes); samples are then given as
     /// length-prefixed NAL units (4-byte lengths).
     pub fn h264(sps: &[u8], pps: &[u8], timescale: u32) -> anyhow::Result<Self> {
-        Self::with_format(vt::h264_format(sps, pps)?, timescale)
+        Self::with_format(vt::h264_format(sps, pps)?, timescale, None)
     }
 
-    fn with_format(format: CFRetained<CMFormatDescription>, timescale: u32) -> anyhow::Result<Self> {
+    fn with_format(format: CFRetained<CMFormatDescription>, timescale: u32, size: Option<(u32, u32)>) -> anyhow::Result<Self> {
         // 420v: what the encoder takes.
+        let k = keys();
         let pixel = CFNumber::new_i32(PIXEL_FORMAT_420V as i32);
-        let attributes = vt::dict(&[(keys().pixel_format, &pixel)]);
+        let attributes = match size {
+            Some((w, h)) => {
+                let (w, h) = (CFNumber::new_i32(w as i32), CFNumber::new_i32(h as i32));
+                vt::dict(&[(k.pixel_format, &pixel), (k.width, &w), (k.height, &h)])
+            }
+            None => vt::dict(&[(k.pixel_format, &pixel)]),
+        };
         let session = Decompression::new(&format, Some(attributes.as_ref()))?;
         Ok(Self { session, format, timescale })
+    }
+
+    /// Decode without waiting for each picture (batch work, faster than real time): pictures come out of later
+    /// calls, and all of them by `flush`.
+    pub fn asynchronous(&mut self) {
+        self.session.asynchronous();
     }
 
     /// Decode one coded picture; returns the pictures that came out (in decode order: sort by `pts`).
