@@ -33,7 +33,7 @@ struct Sink {
 pub struct HevcDecoder {
     session: VTDecompressionSessionRef,
     format: CMFormatDescriptionRef,
-    sink: Box<Sink>,
+    sink: Box<std::sync::Mutex<Sink>>,
     timescale: u32,
 }
 
@@ -41,9 +41,9 @@ pub struct HevcDecoder {
 unsafe impl Send for HevcDecoder {}
 
 extern "C" fn on_picture(refcon: *mut c_void, _frame: *mut c_void, status: OSStatus, _flags: u32, image: CVImageBufferRef, pts: CMTime, _dur: CMTime) {
-    // SAFETY: refcon is the decoder's boxed Sink, alive for the session's life; VideoToolbox calls this while
-    // `decode` runs (synchronous decoding) or during the final wait, never concurrently with another use.
-    let sink = unsafe { &mut *(refcon as *mut Sink) };
+    // SAFETY: refcon is the decoder's boxed, locked Sink, alive for the session's life. VideoToolbox usually calls
+    // this while `decode` runs, but may call it on its own thread, so the sink is locked by both sides.
+    let mut sink = crate::video::lock(unsafe { &*(refcon as *const std::sync::Mutex<Sink>) });
     if status != 0 || image.is_null() {
         if status != 0 {
             sink.error = Some(status);
@@ -120,8 +120,8 @@ impl HevcDecoder {
             )
         };
         ensure!(st == 0, "HEVC format description: OSStatus {st}");
-        let mut sink = Box::new(Sink { width, height, want, out: Vec::new(), error: None });
-        let record = VTDecompressionOutputCallbackRecord { callback: on_picture, refcon: (&raw mut *sink).cast() };
+        let sink = Box::new(std::sync::Mutex::new(Sink { width, height, want, out: Vec::new(), error: None }));
+        let record = VTDecompressionOutputCallbackRecord { callback: on_picture, refcon: (&raw const *sink).cast_mut().cast() };
         let mut session: VTDecompressionSessionRef = null();
         // SAFETY: the attributes dictionary and number are created and released here; the callback record is
         // copied by VideoToolbox; session is an out-parameter.
@@ -179,17 +179,18 @@ impl HevcDecoder {
             CFRelease(sample);
             ensure!(st == 0, "VideoToolbox decode: OSStatus {st}");
         }
-        if let Some(e) = self.sink.error.take() {
+        let mut sink = crate::video::lock(&self.sink);
+        if let Some(e) = sink.error.take() {
             return Err(anyhow!("VideoToolbox picture: OSStatus {e}"));
         }
-        Ok(std::mem::take(&mut self.sink.out))
+        Ok(std::mem::take(&mut sink.out))
     }
 
     /// Pictures still inside the decoder.
     pub fn flush(&mut self) -> Vec<Picture> {
         // SAFETY: the session is live.
         unsafe { VTDecompressionSessionWaitForAsynchronousFrames(self.session) };
-        std::mem::take(&mut self.sink.out)
+        std::mem::take(&mut crate::video::lock(&self.sink).out)
     }
 }
 

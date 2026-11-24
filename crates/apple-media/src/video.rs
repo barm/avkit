@@ -5,6 +5,14 @@ use crate::sys::*;
 use anyhow::{anyhow, ensure};
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// A callback sink's lock. VideoToolbox calls its output callbacks on its own threads (always for compression,
+/// sometimes for decompression), so the sink is shared with the caller and must be locked by both; a poisoned lock
+/// is still usable (nothing in a sink can be left half-updated).
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// A retained CVPixelBuffer (a decoded picture), released on drop.
 pub struct PixelBuffer(CVImageBufferRef);
@@ -57,8 +65,8 @@ struct DecodeSink {
 }
 
 extern "C" fn on_decoded(refcon: *mut c_void, _f: *mut c_void, status: OSStatus, _flags: u32, image: CVImageBufferRef, pts: CMTime, _d: CMTime) {
-    // SAFETY: refcon is the decoder's boxed sink (see `HevcDecoder` in mac.rs for the same pattern).
-    let sink = unsafe { &mut *(refcon as *mut DecodeSink) };
+    // SAFETY: refcon is the decoder's boxed, locked sink, alive for the session's life.
+    let mut sink = lock(unsafe { &*(refcon as *const Mutex<DecodeSink>) });
     if status != 0 {
         sink.error = Some(status);
     } else if !image.is_null() {
@@ -71,7 +79,7 @@ extern "C" fn on_decoded(refcon: *mut c_void, _f: *mut c_void, status: OSStatus,
 pub struct Decoder {
     session: VTDecompressionSessionRef,
     format: CMFormatDescriptionRef,
-    sink: Box<DecodeSink>,
+    sink: Box<Mutex<DecodeSink>>,
     timescale: u32,
 }
 
@@ -100,8 +108,8 @@ impl Decoder {
 
     /// A decoder for a format description (taken over: released with the decoder).
     fn with_format(format: CMFormatDescriptionRef, timescale: u32) -> anyhow::Result<Self> {
-        let mut sink = Box::new(DecodeSink { out: Vec::new(), error: None });
-        let record = VTDecompressionOutputCallbackRecord { callback: on_decoded, refcon: (&raw mut *sink).cast() };
+        let sink = Box::new(Mutex::new(DecodeSink { out: Vec::new(), error: None }));
+        let record = VTDecompressionOutputCallbackRecord { callback: on_decoded, refcon: (&raw const *sink).cast_mut().cast() };
         let mut session: VTDecompressionSessionRef = null();
         // SAFETY: as in mac.rs: attributes created and released here, record copied, session out-parameter.
         let st = unsafe {
@@ -155,16 +163,17 @@ impl Decoder {
                 return Err(anyhow!("video decode: OSStatus {st}"));
             }
         }
-        if let Some(e) = self.sink.error.take() {
+        let mut sink = lock(&self.sink);
+        if let Some(e) = sink.error.take() {
             return Err(anyhow!("video decode: OSStatus {e}"));
         }
-        Ok(std::mem::take(&mut self.sink.out))
+        Ok(std::mem::take(&mut sink.out))
     }
 
     pub fn flush(&mut self) -> Vec<Decoded> {
         // SAFETY: a live session.
         unsafe { VTDecompressionSessionWaitForAsynchronousFrames(self.session) };
-        std::mem::take(&mut self.sink.out)
+        std::mem::take(&mut lock(&self.sink).out)
     }
 }
 
@@ -195,8 +204,9 @@ struct EncodeSink {
 }
 
 extern "C" fn on_encoded(refcon: *mut c_void, _f: *mut c_void, status: OSStatus, _flags: u32, sample: CMSampleBufferRef) {
-    // SAFETY: refcon is the encoder's boxed sink; VideoToolbox calls this during encode/complete calls.
-    let sink = unsafe { &mut *(refcon as *mut EncodeSink) };
+    // SAFETY: refcon is the encoder's boxed, locked sink, alive for the session's life. VideoToolbox calls this on
+    // its own thread, while the encoder's owner may be taking output: hence the lock.
+    let mut sink = lock(unsafe { &*(refcon as *const Mutex<EncodeSink>) });
     if status != 0 {
         sink.error = Some(status);
         return;
@@ -251,7 +261,7 @@ pub enum Rate {
 /// every `max_key_secs`.
 pub struct Encoder {
     session: VTCompressionSessionRef,
-    sink: Box<EncodeSink>,
+    sink: Box<Mutex<EncodeSink>>,
     timescale: u32,
     force_key: CFDictionaryRef,
 }
@@ -260,7 +270,7 @@ unsafe impl Send for Encoder {}
 
 impl Encoder {
     pub fn new(width: u32, height: u32, rate: Rate, fps: f64, max_key_secs: f64, realtime: bool, timescale: u32) -> anyhow::Result<Self> {
-        let mut sink = Box::new(EncodeSink { out: Vec::new(), error: None, hvcc: None });
+        let sink = Box::new(Mutex::new(EncodeSink { out: Vec::new(), error: None, hvcc: None }));
         let mut session: VTCompressionSessionRef = null();
         // SAFETY: the dictionaries and numbers are created, used and released here; session is an out-parameter
         // and the sink outlives it (it is dropped after the session is invalidated).
@@ -284,7 +294,7 @@ impl Encoder {
                 null(),
                 null(),
                 on_encoded,
-                (&raw mut *sink).cast(),
+                (&raw const *sink).cast_mut().cast(),
                 &raw mut session,
             );
             CFRelease(spec);
@@ -346,10 +356,11 @@ impl Encoder {
             )
         };
         ensure!(st == 0, "HEVC encode: OSStatus {st}");
-        if let Some(e) = self.sink.error.take() {
+        let mut sink = lock(&self.sink);
+        if let Some(e) = sink.error.take() {
             return Err(anyhow!("HEVC encode: OSStatus {e}"));
         }
-        Ok(std::mem::take(&mut self.sink.out))
+        Ok(std::mem::take(&mut sink.out))
     }
 
     /// Everything still in the encoder.
@@ -357,12 +368,12 @@ impl Encoder {
         // SAFETY: a live session; an invalid time means "all frames".
         let st = unsafe { VTCompressionSessionCompleteFrames(self.session, CMTime::INVALID) };
         ensure!(st == 0, "HEVC encode: OSStatus {st}");
-        Ok(std::mem::take(&mut self.sink.out))
+        Ok(std::mem::take(&mut lock(&self.sink).out))
     }
 
     /// The `hvcC` box body, once the first picture is out.
-    pub fn hvcc(&self) -> Option<&[u8]> {
-        self.sink.hvcc.as_deref()
+    pub fn hvcc(&self) -> Option<Vec<u8>> {
+        lock(&self.sink).hvcc.clone()
     }
 }
 
