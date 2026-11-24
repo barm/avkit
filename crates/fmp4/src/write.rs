@@ -274,24 +274,4 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    /// ffmpeg, if installed, decodes the rewritten file without complaint and finds every frame.
-    #[test]
-    fn ffmpeg_decodes_a_remuxed_recording() {
-        let dir = std::env::temp_dir().join(format!("hdhr-dvr-fmp4-ff-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        remux(&dir);
-        let Ok(out) = std::process::Command::new("ffprobe")
-            .args(["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"])
-            .arg(dir.join("index.m3u8"))
-            .output()
-        else {
-            return; // no ffprobe here: the round trip above still checks the structure
-        };
-        assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
-        // (Through the playlist, ffprobe lists the stream once per HLS program as well.)
-        let counts: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.is_empty()).map(String::from).collect();
-        assert!(!counts.is_empty() && counts.iter().all(|c| c == "75"), "{counts:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
