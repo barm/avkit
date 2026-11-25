@@ -1,0 +1,13 @@
+[package]
+name = "apple-coreml"
+version = "0.1.0"
+edition = "2024"
+description = "Run Core ML models from Rust: load an .mlpackage or .mlmodelc and predict on float32 tensors. macOS."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/barm/avkit"
+
+[dependencies]
+anyhow = "1"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue"] }
+objc2-core-ml = { version = "0.3", features = ["MLModel", "MLModel_MLModelCompilation", "MLModelConfiguration", "MLMultiArray", "MLFeatureValue", "MLFeatureProvider", "MLDictionaryFeatureProvider"] }
