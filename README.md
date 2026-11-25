@@ -26,4 +26,12 @@ fmp4 = { git = "https://github.com/barm/avkit", rev = "<commit>" }
 
 ## License
 
-MIT or Apache-2.0, at your option.
+This project is dual-licensed. You may use it under either of these licenses, whichever you prefer:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+Both grants apply to everyone; the choice between them is yours as the user, and there is nothing to ask for.
+
+Unless you say otherwise, any contribution you intentionally submit for inclusion in this project, as defined in
+the Apache-2.0 license, is dual-licensed as above, with no additional terms or conditions.
