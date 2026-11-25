@@ -17,6 +17,9 @@ use objc2_core_video::CVPixelBufferGetPixelFormatType;
 pub struct Picture {
     pub pts: i64,
     pub luma: Vec<u8>,
+    /// For pictures picked for colour (see `HevcDecoder::set_color`): the whole picture squashed to a square,
+    /// RGB, 0.0–1.0, planar (all red, then green, then blue), row-major.
+    pub rgb: Option<Vec<f32>>,
 }
 
 /// A decoded picture's luma, shrunk to `dw`×`dh` and stretched to full range.
@@ -25,6 +28,47 @@ fn luma(picture: &PixelBuffer, dw: usize, dh: usize) -> anyhow::Result<Vec<u8>> 
     ensure!(format == PIXEL_FORMAT_420V || format == PIXEL_FORMAT_420F, "unexpected pixel format {format:#x}");
     vt::read_plane(picture.cv(), 0, |bytes, w, h, stride| shrink(bytes, w, h, stride, dw, dh, format == PIXEL_FORMAT_420V))
         .ok_or_else(|| anyhow!("cannot read the picture's luma"))
+}
+
+/// The picture as planar RGB (0.0–1.0), `size`×`size`: each output pixel the mean of the source pixels it covers,
+/// converted from video-range BT.709 YCbCr.
+fn rgb(picture: &PixelBuffer, size: usize) -> anyhow::Result<Vec<f32>> {
+    let y = vt::read_plane(picture.cv(), 0, |b, w, h, stride| area_mean(b, w, h, stride, 1, size)).ok_or_else(|| anyhow!("cannot read luma"))?;
+    let c = vt::read_plane(picture.cv(), 1, |b, w, h, stride| area_mean(b, w, h, stride, 2, size)).ok_or_else(|| anyhow!("cannot read chroma"))?;
+    let n = size * size;
+    let mut out = vec![0f32; 3 * n];
+    for i in 0..n {
+        let yy = (y[i] - 16.0) / 219.0;
+        let (cb, cr) = ((c[2 * i] - 128.0) / 224.0, (c[2 * i + 1] - 128.0) / 224.0);
+        out[i] = (yy + 1.5748 * cr).clamp(0.0, 1.0);
+        out[n + i] = (yy - 0.1873 * cb - 0.4681 * cr).clamp(0.0, 1.0);
+        out[2 * n + i] = (yy + 1.8556 * cb).clamp(0.0, 1.0);
+    }
+    Ok(out)
+}
+
+/// Means of a plane (`w`×`h` pixels of `channels` interleaved bytes, `stride` bytes a row) over a `size`×`size`
+/// grid, interleaved like the input.
+fn area_mean(src: &[u8], w: usize, h: usize, stride: usize, channels: usize, size: usize) -> Vec<f32> {
+    let mut out = vec![0f32; size * size * channels];
+    for oy in 0..size {
+        let (y0, y1) = (oy * h / size, ((oy + 1) * h / size).max(oy * h / size + 1));
+        for ox in 0..size {
+            let (x0, x1) = (ox * w / size, ((ox + 1) * w / size).max(ox * w / size + 1));
+            let count = ((x1 - x0) * (y1 - y0)) as f32;
+            for ch in 0..channels {
+                let mut sum = 0u32;
+                for y in y0..y1 {
+                    let row = &src[y * stride..];
+                    for x in x0..x1 {
+                        sum += u32::from(row[x * channels + ch]);
+                    }
+                }
+                out[(oy * size + ox) * channels + ch] = sum as f32 / count;
+            }
+        }
+    }
+    out
 }
 
 /// Average `src` (w×h, `stride` bytes a row) down to `dw`×`dh`, each output pixel the mean of the source pixels
@@ -46,6 +90,9 @@ fn shrink(src: &[u8], w: usize, h: usize, stride: usize, dw: usize, dh: usize, v
     out
 }
 
+/// Chooses pictures by presentation time.
+pub type Pick = Box<dyn FnMut(i64) -> bool + Send>;
+
 /// An HEVC decoder (hardware where the Mac has one) that hands back pictures shrunk to the scan's size.
 pub struct HevcDecoder {
     session: Decompression,
@@ -55,6 +102,8 @@ pub struct HevcDecoder {
     height: usize,
     /// Which pictures to keep (by presentation time, in the track's timescale), decided by the caller.
     want: Box<dyn FnMut(i64) -> bool + Send>,
+    /// Square size and picker for the pictures also handed back in colour.
+    color: Option<(usize, Pick)>,
 }
 
 impl HevcDecoder {
@@ -74,7 +123,13 @@ impl HevcDecoder {
         let mut session = Decompression::new(&format, Some(attributes.as_ref()))?;
         // Analysis is batch work: let the decoder run ahead (the caller flushes after each run of fragments).
         session.asynchronous();
-        Ok(Self { session, format, timescale, width, height, want })
+        Ok(Self { session, format, timescale, width, height, want, color: None })
+    }
+
+    /// Also hand back, in colour (`Picture::rgb`, `size`×`size`), the wanted pictures `pick` accepts (by
+    /// presentation time).
+    pub fn set_color(&mut self, size: usize, pick: Pick) {
+        self.color = Some((size, pick));
     }
 
     /// Decode one coded picture (length-prefixed NAL units) with its times; returns the pictures that came out.
@@ -96,7 +151,17 @@ impl HevcDecoder {
         for msg in self.session.drain() {
             let (pts, picture) = msg.map_err(|e| anyhow!("VideoToolbox picture: OSStatus {e}"))?;
             if (self.want)(pts) {
-                out.push(Picture { pts, luma: luma(&picture, self.width, self.height)? });
+                let rgb = match self.color.as_mut() {
+                    Some((size, pick)) => {
+                        if pick(pts) {
+                            Some(rgb(&picture, *size)?)
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                out.push(Picture { pts, luma: luma(&picture, self.width, self.height)?, rgb });
             }
         }
         Ok(out)
@@ -155,5 +220,19 @@ mod tests {
         let src = [16, 16, 235, 235, 16, 16, 235, 235];
         assert_eq!(shrink(&src, 4, 2, 4, 2, 1, true), vec![0, 255]);
         assert_eq!(shrink(&src, 4, 2, 4, 1, 1, false), vec![125]);
+    }
+
+    #[test]
+    fn area_means_interleaved_channels() {
+        // 4×2 of (a, b) pairs; stride 10 bytes (padding at the end of each row).
+        let mut src = vec![0u8; 20];
+        for y in 0..2 {
+            for x in 0..4 {
+                src[y * 10 + x * 2] = (x * 10) as u8;
+                src[y * 10 + x * 2 + 1] = 200;
+            }
+        }
+        let m = area_mean(&src, 4, 2, 10, 2, 2);
+        assert_eq!(m, vec![5.0, 200.0, 25.0, 200.0, 5.0, 200.0, 25.0, 200.0]);
     }
 }
