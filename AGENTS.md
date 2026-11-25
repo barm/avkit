@@ -1,7 +1,8 @@
 # avkit agent guide
 
-Media crates shared by barm/dvr and barm/adbreak (git dependencies pinned by rev: a change reaches them only when
-their pin moves). avkit depends on neither.
+Media crates used by other projects, barm/adbreak among them, as git dependencies pinned by rev (a change reaches
+them only when their pin moves). avkit depends on none of them. This repository is public: don't mention private
+projects, hosts or paths in code, docs or commit messages.
 
 - One job per crate; new self-contained functionality gets its own crate.
 - `unsafe`: the pure crates and those built on the others (`mpegts`, `captions`, `fmp4`, `fmp4-scan`, `fmp4-shrink`) `#![forbid(unsafe_code)]`. FFI to Apple's

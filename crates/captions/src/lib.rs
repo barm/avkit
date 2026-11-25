@@ -353,10 +353,10 @@ mod tests {
         assert_eq!(stamp(3723.25), "01:02:03.250");
     }
 
-    /// The captions of a whole capture (`DVR_TS_SAMPLE`), next to what ffmpeg reads from it.
+    /// The captions of a whole capture (`AVKIT_TS_SAMPLE`), next to what ffmpeg reads from it.
     #[test]
     fn reads_broadcast_captions() {
-        let Ok(path) = std::env::var("DVR_TS_SAMPLE") else { return };
+        let Ok(path) = std::env::var("AVKIT_TS_SAMPLE") else { return };
         let bytes = std::fs::read(&path).unwrap();
         let mut demux = mpegts::Demuxer::new();
         let mut d = Decoder::new();
