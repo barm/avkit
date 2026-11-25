@@ -2,8 +2,7 @@
 
 Broadcast TV media in Rust, on Apple's hardware codecs. No ffmpeg.
 
-Split out of [barm/dvr](https://github.com/barm/dvr) (history included) so other projects can share it; the DVR
-and [barm/adbreak](https://github.com/barm/adbreak) depend on it.
+Used by [barm/adbreak](https://github.com/barm/adbreak) (commercial-break detection) among others.
 
 | Crate | What it does | Platform |
 |---|---|---|

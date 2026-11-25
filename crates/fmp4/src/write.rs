@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn a_remuxed_recording_reads_back_the_same() {
-        let dir = std::env::temp_dir().join(format!("hdhr-dvr-fmp4-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("avkit-fmp4-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (_, original) = remux(&dir);
         let out = std::fs::read(dir.join("media.mp4")).unwrap();

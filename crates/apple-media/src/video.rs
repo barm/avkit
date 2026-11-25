@@ -175,10 +175,10 @@ mod tests {
     use super::*;
     use mpegts::{Demuxer, Unit};
 
-    /// Decode a whole broadcast capture (not in the repository: set `DVR_TS_SAMPLE` to a .ts file).
+    /// Decode a whole broadcast capture (not in the repository: set `AVKIT_TS_SAMPLE` to a .ts file).
     #[test]
     fn decodes_broadcast_mpeg2() {
-        let Ok(path) = std::env::var("DVR_TS_SAMPLE") else { return };
+        let Ok(path) = std::env::var("AVKIT_TS_SAMPLE") else { return };
         let bytes = std::fs::read(path).unwrap();
         let mut d = Demuxer::new();
         let mut units = d.push(&bytes);

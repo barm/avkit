@@ -75,8 +75,8 @@ pub fn shrink(input: &Path, out_dir: &Path, settings: &Settings, progress: &mut 
                 fed_in: 0,
                 came_out: 0,
                 // The encoder's output runs its priming (2112 samples) behind its input: start the input that far in,
-                // so the copy's sound sits where the source's does when both are decoded the same way. (The DVR's
-                // `AAC_PRIMING` is one packet less, the one a player holds back: a constant of the decoder, which
+                // so the copy's sound sits where the source's does when both are decoded the same way. (`apple_media::audio::
+                // AAC_PRIMING` is one packet less, the one a player holds back: a constant of the decoder, which
                 // cancels out between source and copy.)
                 next_pos: ENCODER_PRIMING,
                 packets: VecDeque::new(),

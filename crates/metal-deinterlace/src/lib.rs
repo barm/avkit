@@ -229,10 +229,10 @@ mod tests {
     }
 
     /// Deinterlacing thousands of pictures must not grow memory (a long recording does this ~200,000 times an hour).
-    /// Uses a real broadcast capture when `DVR_TS_SAMPLE` names one.
+    /// Uses a real broadcast capture when `AVKIT_TS_SAMPLE` names one.
     #[test]
     fn memory_stays_flat_over_thousands_of_pictures() {
-        let Ok(path) = std::env::var("DVR_TS_SAMPLE") else { return };
+        let Ok(path) = std::env::var("AVKIT_TS_SAMPLE") else { return };
         let bytes = std::fs::read(path).unwrap();
         let mut d = mpegts::Demuxer::new();
         let mut units = d.push(&bytes);
