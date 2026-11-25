@@ -8,7 +8,7 @@ and [barm/adbreak](https://github.com/barm/adbreak) depend on it.
 | Crate | What it does | Platform |
 |---|---|---|
 | `mpegts` | MPEG transport stream demux for ATSC broadcasts: video, main audio and A/53 captions, with timestamps | any |
-| `cea608` | CEA-608 captions (CC1) to WebVTT: pop-on, roll-up and paint-on | any |
+| `captions` | CEA-608 captions (CC1) to WebVTT: pop-on, roll-up and paint-on | any |
 | `fmp4` | Fragmented MP4 (HEVC + AAC) and byte-range HLS playlists: read and write the single-file form | any |
 | `apple-media` | VideoToolbox MPEG-2/H.264/HEVC decode and HEVC encode, AudioToolbox AC-3/E-AC-3/AAC | macOS |
 | `metal-deinterlace` | yadif deinterlacing on the GPU over CoreVideo pixel buffers | macOS |

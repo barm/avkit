@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn reads_back_what_it_writes_and_cuts_out_stretches() {
-        let dir = std::env::temp_dir().join(format!("cea608-vtt-{}.vtt", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("captions-vtt-{}.vtt", std::process::id()));
         let cues = vec![
             Cue { start: 1.0, end: 2.0, text: "BEFORE".into() },
             Cue { start: 10.5, end: 11.0, text: "IN THE BREAK".into() },
