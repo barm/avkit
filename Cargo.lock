@@ -49,7 +49,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cea608"
+name = "captions"
 version = "0.1.0"
 dependencies = [
  "mpegts",
