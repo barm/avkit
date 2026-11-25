@@ -12,7 +12,7 @@ and [barm/adbreak](https://github.com/barm/adbreak) depend on it.
 | `fmp4` | Fragmented MP4 (HEVC + AAC) and byte-range HLS playlists: read and write the single-file form | any |
 | `apple-media` | VideoToolbox MPEG-2/H.264/HEVC decode and HEVC encode, AudioToolbox AC-3/E-AC-3/AAC | macOS |
 | `metal-deinterlace` | yadif deinterlacing on the GPU over CoreVideo pixel buffers | macOS |
-| `fmp4-scan` | a fragmented MP4 recording to small grey pictures and mono sound, for analysis | macOS |
+| `fmp4-scan` | a fragmented MP4 recording to small grey pictures and mono sound for analysis, and optionally one colour picture a second | macOS |
 | `apple-coreml` | run Core ML models on float32 tensors (load an .mlpackage or .mlmodelc, predict) | macOS |
 | `fmp4-shrink` | a small copy of a recording (360p HEVC, mono AAC) with a byte-range playlist, in hardware | macOS |
 

@@ -20,6 +20,9 @@ pub trait Sink {
     fn picture(&mut self, pts: f64, width: usize, height: usize, luma: &[u8]);
     /// Mono samples at `rate` Hz, the first one at `pts` seconds.
     fn sound(&mut self, pts: f64, rate: u32, samples: &[f32]);
+    /// With [`Scan::with_color`]: one picture a second in colour, `size`×`size` planar RGB 0.0–1.0 (the whole
+    /// picture squashed to a square), shown at `pts` seconds.
+    fn color(&mut self, _pts: f64, _size: usize, _rgb: &[f32]) {}
 }
 
 /// A run of a recording's fragments: their bytes, and where they start on the recording's timeline (seconds).
@@ -74,6 +77,24 @@ impl Scan {
         Ok(Self { video: (v.id, v.timescale), audio, init, pictures, sound, width, height, sound_in: 0, sound_out: 0, origin: None })
     }
 
+    /// Also hands the sink one picture a second in colour, `size`×`size` (the first decoded in each second).
+    pub fn with_color(mut self, size: usize) -> Self {
+        let ts = i64::from(self.video.1);
+        let mut last: Option<i64> = None;
+        self.pictures.set_color(
+            size,
+            Box::new(move |pts: i64| {
+                let s = pts.div_euclid(ts);
+                if last.is_some_and(|l| s <= l) {
+                    return false;
+                }
+                last = Some(s);
+                true
+            }),
+        );
+        self
+    }
+
     /// Decodes one run of fragments. Times are placed on the recording's timeline by the fragment's start: the
     /// first picture of the fragment is at `start`, the sound on the same clock.
     pub fn feed(&mut self, f: &Fragment, sink: &mut impl Sink) -> anyhow::Result<()> {
@@ -117,7 +138,11 @@ impl Scan {
         pictures.extend(self.pictures.flush());
         pictures.sort_by_key(|p| p.pts);
         for p in &pictures {
-            sink.picture(p.pts as f64 / f64::from(vts) + offset, self.width, self.height, &p.luma);
+            let pts = p.pts as f64 / f64::from(vts) + offset;
+            sink.picture(pts, self.width, self.height, &p.luma);
+            if let Some(rgb) = &p.rgb {
+                sink.color(pts, ((rgb.len() / 3) as f64).sqrt() as usize, rgb);
+            }
         }
         Ok(())
     }
@@ -178,6 +203,29 @@ mod tests {
             scan.feed(&Fragment { bytes: &MEDIA[off..off + len], start }, &mut c).unwrap();
         }
         check(&c);
+    }
+
+    #[test]
+    fn color_once_a_second() {
+        #[derive(Default)]
+        struct Colors(Vec<(f64, usize, f32)>);
+        impl Sink for Colors {
+            fn picture(&mut self, _: f64, _: usize, _: usize, _: &[u8]) {}
+            fn sound(&mut self, _: f64, _: u32, _: &[f32]) {}
+            fn color(&mut self, pts: f64, size: usize, rgb: &[f32]) {
+                assert_eq!(rgb.len(), 3 * size * size);
+                self.0.push((pts, size, rgb.iter().sum::<f32>() / rgb.len() as f32));
+            }
+        }
+        let mut c = Colors::default();
+        let mut scan = Scan::new(&MEDIA[..1433], 48, 27, 10.0).unwrap().with_color(16);
+        for (off, len, start) in [(1433usize, 57712usize, 0.0), (59145, 31272, 1.001), (90417, 1488, 2.002)] {
+            scan.feed(&Fragment { bytes: &MEDIA[off..off + len], start }, &mut c).unwrap();
+        }
+        // 2.5 s: seconds 0, 1 and 2; the test pattern is colourful, the last second black.
+        assert_eq!(c.0.len(), 3, "{:?}", c.0);
+        assert!(c.0.iter().all(|x| x.1 == 16));
+        assert!(c.0[0].2 > 0.2 && c.0[2].2 < 0.05, "{:?}", c.0);
     }
 
     #[test]
