@@ -1,6 +1,6 @@
 //! H.264 video elementary stream (Annex B, as broadcast): splitting NAL units, the sequence parameter set's picture
-//! size and interlacing, the A/53 captions carried in SEI messages, and conversion to the length-prefixed form
-//! decoders that take MP4-style samples want.
+//! size, interlacing, pixel shape and frame rate, the A/53 captions carried in SEI messages, and conversion to the
+//! length-prefixed form decoders that take MP4-style samples want.
 
 /// NAL unit types used here.
 pub const SPS: u8 = 7;
@@ -94,6 +94,64 @@ pub struct SpsInfo {
     pub interlaced: bool,
     /// Bits of `frame_num` in slice headers (needed to read them).
     pub log2_max_frame_num: u32,
+    /// The pixels' shape (sample aspect ratio, width:height) from the VUI, if the stream says.
+    pub sar: Option<(u32, u32)>,
+    /// Frames a second as a fraction (`30000/1001`), from the VUI's timing info, if the stream says.
+    pub frame_rate: Option<(u32, u32)>,
+}
+
+impl SpsInfo {
+    /// The picture's shape on screen (display aspect ratio, reduced: `(16, 9)`), from the size and the pixel shape
+    /// (square pixels when the stream does not say).
+    pub fn display_aspect(&self) -> (u32, u32) {
+        let (sw, sh) = self.sar.unwrap_or((1, 1));
+        crate::reduce(u64::from(self.width) * u64::from(sw), u64::from(self.height) * u64::from(sh))
+    }
+}
+
+/// Sample aspect ratios by `aspect_ratio_idc` (Table E-1), from 1.
+const SAR: [(u32, u32); 16] =
+    [(1, 1), (12, 11), (10, 11), (16, 11), (40, 33), (24, 11), (20, 11), (32, 11), (80, 33), (18, 11), (15, 11), (64, 33), (160, 99), (4, 3), (3, 2), (2, 1)];
+
+/// A ratio, `(numerator, denominator)`.
+type Ratio = (u32, u32);
+
+/// What the VUI says about pixel shape and frame rate (Annex E), as far as it gets.
+fn vui(b: &mut Bits) -> (Option<Ratio>, Option<Ratio>) {
+    let mut sar = None;
+    let mut rate = None;
+    let _ = (|| -> Option<()> {
+        if b.bit()? == 1 {
+            sar = match b.bits(8)? {
+                255 => Some((b.bits(16)?, b.bits(16)?)),
+                idc @ 1..=16 => Some(SAR[idc as usize - 1]),
+                _ => None,
+            }
+            .filter(|&(w, h)| w > 0 && h > 0);
+        }
+        if b.bit()? == 1 {
+            b.bit()?; // overscan_appropriate
+        }
+        if b.bit()? == 1 {
+            b.bits(4)?; // video_format, video_full_range
+            if b.bit()? == 1 {
+                b.bits(24)?; // colour primaries, transfer, matrix
+            }
+        }
+        if b.bit()? == 1 {
+            b.ue()?; // chroma sample locations
+            b.ue()?;
+        }
+        if b.bit()? == 1 {
+            let (tick, scale) = (b.bits(32)?, b.bits(32)?);
+            // A tick is one field: two make a frame (E.2.1), whether the stream is coded as fields or frames.
+            if tick > 0 && scale > 0 {
+                rate = Some(crate::reduce(u64::from(scale), 2 * u64::from(tick)));
+            }
+        }
+        Some(())
+    })();
+    (sar, rate)
 }
 
 /// Read a sequence parameter set NAL unit.
@@ -164,7 +222,11 @@ pub fn sps_info(nal: &[u8]) -> Option<SpsInfo> {
         crop_y = (t + bo) * unit_y;
     }
     let height = (2 - u32::from(frame_mbs_only)) * height_units * 16;
-    Some(SpsInfo { width: width_mbs * 16 - crop_x, height: height - crop_y, interlaced: !frame_mbs_only, log2_max_frame_num })
+    let (sar, frame_rate) = match b.bit() {
+        Some(1) => vui(&mut b),
+        _ => (None, None),
+    };
+    Some(SpsInfo { width: width_mbs * 16 - crop_x, height: height - crop_y, interlaced: !frame_mbs_only, log2_max_frame_num, sar, frame_rate })
 }
 
 /// What an access unit's first slice says about how it is coded: its `frame_num`, and for a field picture which
@@ -274,10 +336,17 @@ mod tests {
         // 720p progressive and 480i (field-coded, top field first), made by x264 from real captures.
         let progressive = video(include_bytes!("../tests/fixtures/h264-720p.ts"));
         let (sps, _) = progressive.iter().find_map(|au| parameter_sets(au)).expect("parameter sets before a keyframe");
-        assert_eq!(sps_info(&sps), Some(SpsInfo { width: 1280, height: 720, interlaced: false, log2_max_frame_num: 4 }));
+        let info = sps_info(&sps).unwrap();
+        assert_eq!(info, SpsInfo { width: 1280, height: 720, interlaced: false, log2_max_frame_num: 4, sar: Some((1, 1)), frame_rate: Some((60000, 1001)) });
+        assert_eq!(info.display_aspect(), (16, 9));
         let interlaced = video(include_bytes!("../tests/fixtures/h264-480i-eac3.ts"));
         let (sps, _) = interlaced.iter().find_map(|au| parameter_sets(au)).unwrap();
-        assert_eq!(sps_info(&sps), Some(SpsInfo { width: 704, height: 480, interlaced: true, log2_max_frame_num: 4 }));
+        let info = sps_info(&sps).unwrap();
+        // Widescreen SD: 704x480 of 40:33 pixels is 16:9 on screen; one tick is a field, so 29.97 frames a second.
+        assert_eq!(info, SpsInfo { width: 704, height: 480, interlaced: true, log2_max_frame_num: 4, sar: Some((40, 33)), frame_rate: Some((30000, 1001)) });
+        assert_eq!(info.display_aspect(), (16, 9));
+        assert_eq!(SpsInfo { sar: Some((10, 11)), ..info }.display_aspect(), (4, 3));
+        assert_eq!(SpsInfo { sar: None, ..info }.display_aspect(), (22, 15), "square pixels when the stream does not say");
     }
 
     #[test]
