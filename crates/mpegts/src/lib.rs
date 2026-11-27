@@ -284,6 +284,16 @@ impl Demuxer {
     }
 }
 
+/// `n:d` in lowest terms (`(0, 0)` stays as it is).
+pub(crate) fn reduce(n: u64, d: u64) -> (u32, u32) {
+    let (mut a, mut b) = (n, d);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    let g = a.max(1);
+    ((n / g) as u32, (d / g) as u32)
+}
+
 /// A 33-bit PES time from its 5 bytes.
 fn read_ts(b: &[u8]) -> i64 {
     (i64::from(b[0] & 0x0e) << 29) | (i64::from(b[1]) << 22) | (i64::from(b[2] & 0xfe) << 14) | (i64::from(b[3]) << 7) | (i64::from(b[4]) >> 1)
