@@ -16,9 +16,10 @@ use objc2_core_video::{CVImageBuffer, CVPixelBuffer, kCVPixelBufferHeightKey, kC
 use objc2_video_toolbox::{
     VTCompressionOutputCallback, VTCompressionSession, VTDecodeFrameFlags, VTDecodeInfoFlags, VTDecompressionOutputCallback,
     VTDecompressionOutputCallbackRecord, VTDecompressionSession, VTEncodeInfoFlags, VTSessionSetProperty, kVTCompressionPropertyKey_AllowFrameReordering,
-    kVTCompressionPropertyKey_AverageBitRate, kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-    kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_Quality, kVTCompressionPropertyKey_RealTime, kVTEncodeFrameOptionKey_ForceKeyFrame,
-    kVTProfileLevel_HEVC_Main_AutoLevel, kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
+    kVTCompressionPropertyKey_AverageBitRate, kVTCompressionPropertyKey_DataRateLimits, kVTCompressionPropertyKey_ExpectedFrameRate,
+    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_Quality,
+    kVTCompressionPropertyKey_RealTime, kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_HEVC_Main_AutoLevel,
+    kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
 };
 use std::ffi::c_void;
 use std::ptr::{NonNull, null, null_mut};
@@ -50,6 +51,7 @@ pub struct Keys {
     pub hevc_main_auto: &'static CFString,
     pub allow_reordering: &'static CFString,
     pub average_bit_rate: &'static CFString,
+    pub data_rate_limits: &'static CFString,
     pub quality: &'static CFString,
     pub max_key_interval: &'static CFString,
     pub expected_frame_rate: &'static CFString,
@@ -69,6 +71,7 @@ pub fn keys() -> Keys {
             hevc_main_auto: kVTProfileLevel_HEVC_Main_AutoLevel,
             allow_reordering: kVTCompressionPropertyKey_AllowFrameReordering,
             average_bit_rate: kVTCompressionPropertyKey_AverageBitRate,
+            data_rate_limits: kVTCompressionPropertyKey_DataRateLimits,
             quality: kVTCompressionPropertyKey_Quality,
             max_key_interval: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
             expected_frame_rate: kVTCompressionPropertyKey_ExpectedFrameRate,

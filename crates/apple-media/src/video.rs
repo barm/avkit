@@ -4,7 +4,7 @@
 
 use crate::vt::{self, CODEC_HEVC, Compression, Decompression, PIXEL_FORMAT_420V, keys, no, time, yes};
 use anyhow::anyhow;
-use objc2_core_foundation::{CFNumber, CFRetained};
+use objc2_core_foundation::{CFArray, CFNumber, CFRetained};
 use objc2_core_media::CMFormatDescription;
 use objc2_core_video::{CVPixelBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth};
 
@@ -108,10 +108,27 @@ pub struct Encoded {
 pub enum Rate {
     Bitrate(i64),
     Quality(f32),
+    /// Constant quality, but held under `max_bps` (over any `CAP_WINDOW_SECS`): easy pictures stay small, and a
+    /// busy one (a football game) is held at the cap instead of growing without bound.
+    CappedQuality {
+        quality: f32,
+        max_bps: i64,
+    },
 }
 
+/// The stretch a [`Rate::CappedQuality`] cap applies over (decode time). Long enough that a single keyframe or a
+/// burst of motion borrows from its neighbours; short enough that a game cannot run over for minutes.
+pub const CAP_WINDOW_SECS: f64 = 4.0;
+
+/// With a hard data-rate limit and no average bitrate, VideoToolbox's HEVC encoder aims at about this share of the
+/// limit (Apple: "a safe margin below"), and holds there on busy pictures. Measured on 720p football: a limit of
+/// 6 Mbit/s peaked at 4.6 over 4 s, one of 8 at 5.9. So the limit set is the cap divided by this, and the output
+/// stays just under the cap.
+const LIMIT_SHARE: f64 = 0.75;
+
 /// HEVC in hardware: no B-frames (decode order is presentation order), a keyframe whenever asked and at least
-/// every `max_key_secs`.
+/// every `max_key_secs`. Pictures of another size than the session's are scaled to it by VideoToolbox (in
+/// hardware; 1080 broadcasts to 720p, say).
 pub struct Encoder {
     session: Compression,
     /// The `hvcC` box body, from the first keyframe.
@@ -130,6 +147,12 @@ impl Encoder {
         match rate {
             Rate::Bitrate(bps) => session.set(k.average_bit_rate, &CFNumber::new_i64(bps))?,
             Rate::Quality(q) => session.set(k.quality, &CFNumber::new_f64(f64::from(q.clamp(0.0, 1.0))))?,
+            Rate::CappedQuality { quality, max_bps } => {
+                session.set(k.quality, &CFNumber::new_f64(f64::from(quality.clamp(0.0, 1.0))))?;
+                let bytes = CFNumber::new_f64(max_bps as f64 / LIMIT_SHARE / 8.0 * CAP_WINDOW_SECS);
+                let secs = CFNumber::new_f64(CAP_WINDOW_SECS);
+                session.set(k.data_rate_limits, CFArray::from_objects(&[&*bytes, &*secs]).as_ref())?;
+            }
         }
         session.set(k.max_key_interval, &CFNumber::new_f64(max_key_secs))?;
         session.set(k.expected_frame_rate, &CFNumber::new_f64(fps))?;
@@ -202,10 +225,16 @@ mod tests {
         eprintln!("fed {fed} pictures, got {} of {size:?}", pictures.len());
         assert!(pictures.len() + 3 >= fed && !pictures.is_empty());
 
-        // And encode them to HEVC, a keyframe every 2 s, at an average bitrate and at constant quality.
+        // And encode them to HEVC, a keyframe every 2 s, at an average bitrate, at constant quality, and at constant
+        // quality under a cap into a session half the size (the encoder scales the pictures down itself).
         pictures.sort_by_key(|p| p.pts);
-        for rate in [Rate::Bitrate(4_000_000), Rate::Quality(0.6)] {
-            let mut enc = Encoder::new(size.0 as u32, size.1 as u32, rate, 30.0, 2.0, false, 90_000).unwrap();
+        let half = (size.0 as u32 / 2, size.1 as u32 / 2);
+        for (rate, (w, h)) in [
+            (Rate::Bitrate(4_000_000), (size.0 as u32, size.1 as u32)),
+            (Rate::Quality(0.6), (size.0 as u32, size.1 as u32)),
+            (Rate::CappedQuality { quality: 0.6, max_bps: 2_000_000 }, half),
+        ] {
+            let mut enc = Encoder::new(w, h, rate, 30.0, 2.0, false, 90_000).unwrap();
             let t0 = std::time::Instant::now();
             let origin = pictures[0].pts;
             let mut out = Vec::new();
@@ -222,7 +251,12 @@ mod tests {
             out.extend(enc.finish().unwrap());
             let bytes: usize = out.iter().map(|e| e.data.len()).sum();
             let keys = out.iter().filter(|e| e.keyframe).count();
-            eprintln!("{rate:?}: encoded {} pictures, {} keyframes, {:.1} Mbit/s, in {:?}", out.len(), keys, bytes as f64 * 8.0 / 10.0 / 1e6, t0.elapsed());
+            let secs = (pictures[pictures.len() - 1].pts - origin) as f64 / 90_000.0;
+            let mbps = bytes as f64 * 8.0 / secs / 1e6;
+            eprintln!("{rate:?} at {w}x{h}: encoded {} pictures, {} keyframes, {mbps:.2} Mbit/s, in {:?}", out.len(), keys, t0.elapsed());
+            if let Rate::CappedQuality { max_bps, .. } = rate {
+                assert!(mbps * 1e6 <= max_bps as f64 * 1.05, "{mbps:.2} Mbit/s over the cap");
+            }
             assert_eq!(out.len(), pictures.len());
             assert!(enc.hvcc().is_some_and(|h| h.len() > 23));
             assert!(out.windows(2).all(|w| w[1].dts > w[0].dts && w[0].pts == w[0].dts), "no reordering");
