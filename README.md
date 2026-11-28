@@ -10,6 +10,7 @@ Used by [barm/adbreak](https://github.com/barm/adbreak) (commercial-break detect
 | `captions` | CEA-608 captions (CC1) to WebVTT: pop-on, roll-up and paint-on | any |
 | `fmp4` | Fragmented MP4 (HEVC + AAC) and byte-range HLS playlists: read and write the single-file form | any |
 | `apple-media` | VideoToolbox MPEG-2/H.264/HEVC decode and HEVC encode, AudioToolbox AC-3/E-AC-3/AAC | macOS |
+| `metal-analysis` | apple-media's analysis reductions (grey picture, colour means) on the GPU, the same values | macOS |
 | `metal-deinterlace` | yadif deinterlacing on the GPU over CoreVideo pixel buffers | macOS |
 | `fmp4-scan` | a fragmented MP4 recording to small grey pictures and mono sound for analysis, and optionally one colour picture a second | macOS |
 | `apple-coreml` | run Core ML models on float32 tensors (load an .mlpackage or .mlmodelc, predict) | macOS |
