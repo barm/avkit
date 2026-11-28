@@ -1,0 +1,15 @@
+[package]
+name = "metal-analysis"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "apple-media's analysis reductions (the small grey picture, the colour picture's cell means) on the GPU (Metal), over CoreVideo pixel buffers in place: the same values, almost no CPU."
+
+[dependencies]
+anyhow = "1"
+apple-media = { path = "../apple-media" }
+objc2 = "0.6"
+objc2-core-foundation = "0.3"
+objc2-core-video = { version = "0.3", features = ["objc2-metal"] }
+objc2-foundation = "0.3"
+objc2-metal = "0.3"

@@ -25,11 +25,17 @@ pub struct Picture {
     pub rgb: Option<Vec<f32>>,
 }
 
-/// A decoded picture's luma (4:2:0, `420v` or `420f`), shrunk to `dw`×`dh` and stretched to full range.
-pub fn luma(picture: &PixelBuffer, dw: usize, dh: usize) -> anyhow::Result<Vec<u8>> {
+/// Whether a 4:2:0 picture is video range (`420v`) rather than full range (`420f`); an error for anything else.
+pub fn video_range(picture: &PixelBuffer) -> anyhow::Result<bool> {
     let format = CVPixelBufferGetPixelFormatType(picture.cv());
     ensure!(format == PIXEL_FORMAT_420V || format == PIXEL_FORMAT_420F, "unexpected pixel format {format:#x}");
-    vt::read_plane(picture.cv(), 0, |bytes, w, h, stride| shrink(bytes, w, h, stride, dw, dh, format == PIXEL_FORMAT_420V))
+    Ok(format == PIXEL_FORMAT_420V)
+}
+
+/// A decoded picture's luma (4:2:0, `420v` or `420f`), shrunk to `dw`×`dh` and stretched to full range.
+pub fn luma(picture: &PixelBuffer, dw: usize, dh: usize) -> anyhow::Result<Vec<u8>> {
+    let video_range = video_range(picture)?;
+    vt::read_plane(picture.cv(), 0, |bytes, w, h, stride| shrink(bytes, w, h, stride, dw, dh, video_range))
         .ok_or_else(|| anyhow!("cannot read the picture's luma"))
 }
 
@@ -38,6 +44,12 @@ pub fn luma(picture: &PixelBuffer, dw: usize, dh: usize) -> anyhow::Result<Vec<u
 pub fn rgb(picture: &PixelBuffer, size: usize) -> anyhow::Result<Vec<f32>> {
     let y = vt::read_plane(picture.cv(), 0, |b, w, h, stride| area_mean(b, w, h, stride, 1, size)).ok_or_else(|| anyhow!("cannot read luma"))?;
     let c = vt::read_plane(picture.cv(), 1, |b, w, h, stride| area_mean(b, w, h, stride, 2, size)).ok_or_else(|| anyhow!("cannot read chroma"))?;
+    Ok(rgb_from_means(&y, &c, size))
+}
+
+/// [`rgb`] from its cell means: luma (`size`×`size`) and chroma (Cb, Cr interleaved), each a cell's sum over its
+/// pixel count as `f32` (see [`cells`]). For means computed elsewhere (on the GPU) to give the same picture.
+pub fn rgb_from_means(y: &[f32], c: &[f32], size: usize) -> Vec<f32> {
     let n = size * size;
     let mut out = vec![0f32; 3 * n];
     for i in 0..n {
@@ -47,11 +59,11 @@ pub fn rgb(picture: &PixelBuffer, size: usize) -> anyhow::Result<Vec<f32>> {
         out[n + i] = (yy - 0.1873 * cb - 0.4681 * cr).clamp(0.0, 1.0);
         out[2 * n + i] = (yy + 1.8556 * cb).clamp(0.0, 1.0);
     }
-    Ok(out)
+    out
 }
 
 /// The source pixels each of `n` output cells covers along a side of `len` pixels: `[a, b)`, at least one.
-fn cells(len: usize, n: usize) -> Vec<(usize, usize)> {
+pub fn cells(len: usize, n: usize) -> Vec<(usize, usize)> {
     (0..n).map(|o| (o * len / n, ((o + 1) * len / n).max(o * len / n + 1))).collect()
 }
 
@@ -102,13 +114,18 @@ fn area_mean(src: &[u8], w: usize, h: usize, stride: usize, channels: usize, siz
     out
 }
 
+/// A cell's mean luma as the grey picture has it: video range (16–235) stretched to full range, as ffmpeg's
+/// `format=gray` does.
+pub fn stretch(mean: u32, video_range: bool) -> u8 {
+    if video_range { ((mean.saturating_sub(16) * 255 + 109) / 219).min(255) as u8 } else { mean as u8 }
+}
+
 /// Average `src` (w×h, `stride` bytes a row) down to `dw`×`dh`, each output pixel the mean of the source pixels
 /// it covers, and stretch video-range luma (16–235) to full range, as ffmpeg's `format=gray` does.
 fn shrink(src: &[u8], w: usize, h: usize, stride: usize, dw: usize, dh: usize, video_range: bool) -> Vec<u8> {
     let mut out = vec![0u8; dw * dh];
     cell_sums(&Plane { src, w, h, stride, channels: 1 }, dw, dh, |cell, _, sum, count| {
-        let mean = sum / count;
-        out[cell] = if video_range { ((mean.saturating_sub(16) * 255 + 109) / 219).min(255) as u8 } else { mean as u8 };
+        out[cell] = stretch(sum / count, video_range);
     });
     out
 }

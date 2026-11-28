@@ -98,6 +98,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "metal-analysis"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "apple-media",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-core-video",
+ "objc2-foundation",
+ "objc2-metal",
+]
+
+[[package]]
 name = "metal-deinterlace"
 version = "0.1.0"
 dependencies = [
