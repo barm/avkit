@@ -50,27 +50,55 @@ pub fn rgb(picture: &PixelBuffer, size: usize) -> anyhow::Result<Vec<f32>> {
     Ok(out)
 }
 
+/// The source pixels each of `n` output cells covers along a side of `len` pixels: `[a, b)`, at least one.
+fn cells(len: usize, n: usize) -> Vec<(usize, usize)> {
+    (0..n).map(|o| (o * len / n, ((o + 1) * len / n).max(o * len / n + 1))).collect()
+}
+
+/// A plane of `w`×`h` pixels of `channels` interleaved bytes, `stride` bytes a row.
+struct Plane<'a> {
+    src: &'a [u8],
+    w: usize,
+    h: usize,
+    stride: usize,
+    channels: usize,
+}
+
+/// Sums of a plane over a `dw`×`dh` grid of cells (as [`cells`]), with each cell's pixel count: `f(cell index,
+/// channel, sum, count)`. Each band of rows is added up first (a straight run the compiler vectorises), then kept
+/// as running totals, so a cell's sum is a subtraction: the same sums as adding each cell's pixels, in a fraction
+/// of the time.
+fn cell_sums(p: &Plane, dw: usize, dh: usize, mut f: impl FnMut(usize, usize, u32, u32)) {
+    let Plane { src, w, h, stride, channels } = *p;
+    let (xs, ys) = (cells(w, dw), cells(h, dh));
+    let width = w * channels;
+    let mut row = vec![0u32; width];
+    let mut pre = vec![0u32; width + channels];
+    for (oy, &(y0, y1)) in ys.iter().enumerate() {
+        row.fill(0);
+        for y in y0..y1 {
+            for (acc, &p) in row.iter_mut().zip(&src[y * stride..y * stride + width]) {
+                *acc += u32::from(p);
+            }
+        }
+        // Running totals along the row, per channel: a cell's sum is then one subtraction.
+        for k in 0..width {
+            pre[k + channels] = pre[k] + row[k];
+        }
+        for (ox, &(x0, x1)) in xs.iter().enumerate() {
+            let count = ((x1 - x0) * (y1 - y0)) as u32;
+            for ch in 0..channels {
+                f(oy * dw + ox, ch, pre[x1 * channels + ch] - pre[x0 * channels + ch], count);
+            }
+        }
+    }
+}
+
 /// Means of a plane (`w`×`h` pixels of `channels` interleaved bytes, `stride` bytes a row) over a `size`×`size`
 /// grid, interleaved like the input.
 fn area_mean(src: &[u8], w: usize, h: usize, stride: usize, channels: usize, size: usize) -> Vec<f32> {
     let mut out = vec![0f32; size * size * channels];
-    for oy in 0..size {
-        let (y0, y1) = (oy * h / size, ((oy + 1) * h / size).max(oy * h / size + 1));
-        for ox in 0..size {
-            let (x0, x1) = (ox * w / size, ((ox + 1) * w / size).max(ox * w / size + 1));
-            let count = ((x1 - x0) * (y1 - y0)) as f32;
-            for ch in 0..channels {
-                let mut sum = 0u32;
-                for y in y0..y1 {
-                    let row = &src[y * stride..];
-                    for x in x0..x1 {
-                        sum += u32::from(row[x * channels + ch]);
-                    }
-                }
-                out[(oy * size + ox) * channels + ch] = sum as f32 / count;
-            }
-        }
-    }
+    cell_sums(&Plane { src, w, h, stride, channels }, size, size, |cell, ch, sum, count| out[cell * channels + ch] = sum as f32 / count as f32);
     out
 }
 
@@ -78,18 +106,10 @@ fn area_mean(src: &[u8], w: usize, h: usize, stride: usize, channels: usize, siz
 /// it covers, and stretch video-range luma (16–235) to full range, as ffmpeg's `format=gray` does.
 fn shrink(src: &[u8], w: usize, h: usize, stride: usize, dw: usize, dh: usize, video_range: bool) -> Vec<u8> {
     let mut out = vec![0u8; dw * dh];
-    for oy in 0..dh {
-        let (y0, y1) = (oy * h / dh, ((oy + 1) * h / dh).max(oy * h / dh + 1));
-        for ox in 0..dw {
-            let (x0, x1) = (ox * w / dw, ((ox + 1) * w / dw).max(ox * w / dw + 1));
-            let mut sum = 0u32;
-            for y in y0..y1 {
-                sum += src[y * stride + x0..y * stride + x1].iter().map(|&p| u32::from(p)).sum::<u32>();
-            }
-            let mean = sum / ((x1 - x0) * (y1 - y0)) as u32;
-            out[oy * dw + ox] = if video_range { ((mean.saturating_sub(16) * 255 + 109) / 219).min(255) as u8 } else { mean as u8 };
-        }
-    }
+    cell_sums(&Plane { src, w, h, stride, channels: 1 }, dw, dh, |cell, _, sum, count| {
+        let mean = sum / count;
+        out[cell] = if video_range { ((mean.saturating_sub(16) * 255 + 109) / 219).min(255) as u8 } else { mean as u8 };
+    });
     out
 }
 
@@ -222,6 +242,71 @@ impl AacDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The implementations before `cell_sums`, cell by cell: the faster ones must give exactly the same.
+    mod before {
+        /// Means of a plane (`w`×`h` pixels of `channels` interleaved bytes, `stride` bytes a row) over a `size`×`size`
+        /// grid, interleaved like the input.
+        pub fn area_mean(src: &[u8], w: usize, h: usize, stride: usize, channels: usize, size: usize) -> Vec<f32> {
+            let mut out = vec![0f32; size * size * channels];
+            for oy in 0..size {
+                let (y0, y1) = (oy * h / size, ((oy + 1) * h / size).max(oy * h / size + 1));
+                for ox in 0..size {
+                    let (x0, x1) = (ox * w / size, ((ox + 1) * w / size).max(ox * w / size + 1));
+                    let count = ((x1 - x0) * (y1 - y0)) as f32;
+                    for ch in 0..channels {
+                        let mut sum = 0u32;
+                        for y in y0..y1 {
+                            let row = &src[y * stride..];
+                            for x in x0..x1 {
+                                sum += u32::from(row[x * channels + ch]);
+                            }
+                        }
+                        out[(oy * size + ox) * channels + ch] = sum as f32 / count;
+                    }
+                }
+            }
+            out
+        }
+
+        /// Average `src` (w×h, `stride` bytes a row) down to `dw`×`dh`, each output pixel the mean of the source pixels
+        /// it covers, and stretch video-range luma (16–235) to full range, as ffmpeg's `format=gray` does.
+        pub fn shrink(src: &[u8], w: usize, h: usize, stride: usize, dw: usize, dh: usize, video_range: bool) -> Vec<u8> {
+            let mut out = vec![0u8; dw * dh];
+            for oy in 0..dh {
+                let (y0, y1) = (oy * h / dh, ((oy + 1) * h / dh).max(oy * h / dh + 1));
+                for ox in 0..dw {
+                    let (x0, x1) = (ox * w / dw, ((ox + 1) * w / dw).max(ox * w / dw + 1));
+                    let mut sum = 0u32;
+                    for y in y0..y1 {
+                        sum += src[y * stride + x0..y * stride + x1].iter().map(|&p| u32::from(p)).sum::<u32>();
+                    }
+                    let mean = sum / ((x1 - x0) * (y1 - y0)) as u32;
+                    out[oy * dw + ox] = if video_range { ((mean.saturating_sub(16) * 255 + 109) / 219).min(255) as u8 } else { mean as u8 };
+                }
+            }
+            out
+        }
+    }
+
+    #[test]
+    fn faster_reductions_give_the_same_pictures() {
+        // Odd sizes and strides, every ratio the scan meets (720p, 1080, SD, and a square for colour).
+        let mut seed = 12345u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) as u8
+        };
+        for &(w, h, dw, dh) in &[(1280, 720, 480, 270), (1920, 1080, 480, 270), (704, 480, 480, 270), (333, 211, 48, 27), (1280, 720, 256, 256)] {
+            let stride = w * 2 + 37;
+            let src: Vec<u8> = (0..stride * h).map(|_| next()).collect();
+            for vr in [true, false] {
+                assert_eq!(shrink(&src, w, h, stride, dw, dh, vr), before::shrink(&src, w, h, stride, dw, dh, vr), "luma {w}x{h} to {dw}x{dh}");
+            }
+            assert_eq!(area_mean(&src, w / 2, h / 2, stride, 2, dw.min(dh)), before::area_mean(&src, w / 2, h / 2, stride, 2, dw.min(dh)), "chroma {w}x{h}");
+            assert_eq!(area_mean(&src, w, h, stride, 1, dw.min(dh)), before::area_mean(&src, w, h, stride, 1, dw.min(dh)), "luma means {w}x{h}");
+        }
+    }
 
     #[test]
     fn loudest_channel_at_each_instant() {
