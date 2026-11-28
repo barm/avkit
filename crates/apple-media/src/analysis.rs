@@ -1,5 +1,8 @@
 //! Decoding for analysis: HEVC pictures shrunk to small luma images (VideoToolbox, in hardware) and AAC folded
 //! to one channel (AudioToolbox). Safe code over `vt` and `at`.
+//!
+//! The same reductions are public for pictures and sound decoded elsewhere (a transcoder's own frames, before it
+//! encodes them): [`luma`], [`rgb`] and [`loudest`], so an analysis of either gives the same inputs.
 
 use anyhow::{anyhow, ensure};
 
@@ -22,17 +25,17 @@ pub struct Picture {
     pub rgb: Option<Vec<f32>>,
 }
 
-/// A decoded picture's luma, shrunk to `dw`×`dh` and stretched to full range.
-fn luma(picture: &PixelBuffer, dw: usize, dh: usize) -> anyhow::Result<Vec<u8>> {
+/// A decoded picture's luma (4:2:0, `420v` or `420f`), shrunk to `dw`×`dh` and stretched to full range.
+pub fn luma(picture: &PixelBuffer, dw: usize, dh: usize) -> anyhow::Result<Vec<u8>> {
     let format = CVPixelBufferGetPixelFormatType(picture.cv());
     ensure!(format == PIXEL_FORMAT_420V || format == PIXEL_FORMAT_420F, "unexpected pixel format {format:#x}");
     vt::read_plane(picture.cv(), 0, |bytes, w, h, stride| shrink(bytes, w, h, stride, dw, dh, format == PIXEL_FORMAT_420V))
         .ok_or_else(|| anyhow!("cannot read the picture's luma"))
 }
 
-/// The picture as planar RGB (0.0–1.0), `size`×`size`: each output pixel the mean of the source pixels it covers,
-/// converted from video-range BT.709 YCbCr.
-fn rgb(picture: &PixelBuffer, size: usize) -> anyhow::Result<Vec<f32>> {
+/// The picture (4:2:0) as planar RGB (0.0–1.0), `size`×`size`: each output pixel the mean of the source pixels it
+/// covers, converted from video-range BT.709 YCbCr.
+pub fn rgb(picture: &PixelBuffer, size: usize) -> anyhow::Result<Vec<f32>> {
     let y = vt::read_plane(picture.cv(), 0, |b, w, h, stride| area_mean(b, w, h, stride, 1, size)).ok_or_else(|| anyhow!("cannot read luma"))?;
     let c = vt::read_plane(picture.cv(), 1, |b, w, h, stride| area_mean(b, w, h, stride, 2, size)).ok_or_else(|| anyhow!("cannot read chroma"))?;
     let n = size * size;
@@ -170,6 +173,12 @@ impl HevcDecoder {
 
 // ---- AAC -------------------------------------------------------------------------------------------------
 
+/// Interleaved sound folded to one channel for the silence detector: each sample the loudest of the channels at
+/// that instant (a quiet moment is quiet on every channel; averaging would hide a voice only in the centre channel).
+pub fn loudest(interleaved: &[f32], channels: usize) -> Vec<f32> {
+    interleaved.chunks_exact(channels.max(1)).map(|f| f.iter().fold(0f32, |m, s| m.max(s.abs()))).collect()
+}
+
 const AAC_FRAMES_PER_PACKET: u32 = 1024;
 
 /// An AAC decoder whose output is folded to one channel for the silence detector: each sample is the loudest of
@@ -196,7 +205,7 @@ impl AacDecoder {
     /// Decode one packet; returns the mono samples that came out (the decoder may hold some back at first).
     pub fn decode(&mut self, packet: &[u8]) -> anyhow::Result<Vec<f32>> {
         let channels = self.channels;
-        Ok(self.decode_channels(packet)?.chunks_exact(channels).map(|f| f.iter().fold(0f32, |m, s| m.max(s.abs()))).collect())
+        Ok(loudest(self.decode_channels(packet)?, channels))
     }
 
     /// Decode one packet into every channel, interleaved (5.1 as L R C LFE Ls Rs).
@@ -213,6 +222,11 @@ impl AacDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loudest_channel_at_each_instant() {
+        assert_eq!(loudest(&[0.1, -0.5, 0.0, 0.2, 0.0, 0.0], 3), vec![0.5, 0.2]);
+    }
 
     #[test]
     fn shrinking_averages_and_stretches_video_range() {
